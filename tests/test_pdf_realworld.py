@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import io
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -496,4 +497,263 @@ def test_integrity_after_processing(tmp_path: Path) -> None:
     used = {int(match, 16) for match in _HEX_GLYPH_RE.findall(_page_stream(output))}
     assert used, "в content stream нет глифов CID-шрифта"
     assert max(used) < glyph_count, f"CID {max(used)} вне subset ({glyph_count} глифов)"
+
+
+# --------------------------------------------------------------------------- #
+# Подмена шрифта: --pdf-substitute-fonts {strict,base14,always}
+# --------------------------------------------------------------------------- #
+LIBERATION = Path("/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf")
+LIBERATION_LATIN = Path("/tmp/LiberationSerif-latin-subset.ttf")
+LATIN_ONLY_SUBSET = Path("/tmp/DejaVuSans-latin-subset.ttf")
+SUBSTITUTION_TEXT = "Обратная связь"
+
+
+def _subset_latin(source_font: Path, target: Path) -> Path:
+    """Урезать шрифт до латиницы и вернуть путь (эмуляция встроенных сабсетов)."""
+    if not target.exists():
+        from fontTools import subset
+
+        subset.main(
+            [str(source_font), "--unicodes=U+0020-007E", f"--output-file={target}"]
+        )
+    return target
+
+
+def _build_liberation_pdf(path: Path) -> Path:
+    """PDF с простым TrueType-сабсетом Liberation (как экспорт LibreOffice).
+
+    Шрифт встроен как ``/TrueType`` и не содержит кириллицы — ровно то, что
+    движок расширять не умеет.
+    """
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont as ReportLabTTFont
+    from reportlab.pdfgen import canvas as reportlab_canvas
+
+    subset = _subset_latin(LIBERATION, LIBERATION_LATIN)
+    pdfmetrics.registerFont(ReportLabTTFont("LibSub", str(subset)))
+
+    document = reportlab_canvas.Canvas(str(path))
+    document.setFont("LibSub", 12)
+    document.drawString(72, 700, "The feedback from the meeting was clear.")
+    document.drawString(72, 680, "Second line about roadmap and deadline.")
+    document.save()
+    return path
+
+
+def _latin_only_subset() -> Path:
+    """Type0-сабсет DejaVu только с латиницей (эмуляция LaTeX-сабсета)."""
+    return _subset_latin(DEJAVU, LATIN_ONLY_SUBSET)
+
+
+def _build_latex_subset_pdf(path: Path) -> Path:
+    """PDF с Type0-сабсетом без кириллических глифов (LaTeX-подобный)."""
+    subset_path = _latin_only_subset()
+    document = pymupdf.open()
+    page = document.new_page()
+    for y, text in (
+        (100, "The feedback from the meeting was clear."),
+        (130, "Second line about roadmap and deadline."),
+    ):
+        page.insert_text(
+            (72, y), text, fontsize=12, fontname="SubX", fontfile=str(subset_path)
+        )
+    document.save(str(path))
+    document.close()
+    return path
+
+
+def _replace_first(path: Path, output: Path, **options: object) -> dict:
+    """Заменить первое слово в первом блоке с латиницей на кириллицу."""
+    plan = _plan(path, "feedback", SUBSTITUTION_TEXT)
+    assert plan, f"в {path.name} нет блока с 'feedback'"
+    return DocumentProcessor(**options).apply_replacements(str(path), plan, str(output))
+
+
+def _warnings_of(result: dict, kind: str) -> list[dict]:
+    """Записи предупреждений указанного вида."""
+    return [item for item in result["warnings"] if item.get("kind") == kind]
+
+
+def test_strict_default_returns_failure_on_libreoffice(tmp_path: Path) -> None:
+    """strict: не-base-14 шрифт → отказ, документ не портится."""
+    source = _build_liberation_pdf(tmp_path / "liberation.pdf")
+    output = tmp_path / "out.pdf"
+
+    result = _replace_first(source, output)
+
+    assert result["success"] is False
+    assert result["replaced_count"] == 0
+    assert result["errors"]
+    assert "закодировать" in result["errors"][0]["message"] or "encode" in result["errors"][0]["message"]
+    assert _warnings_of(result, "pdf_font_substituted") == []
+    assert output.exists()
+
+
+def test_base14_succeeds_on_libreoffice(tmp_path: Path) -> None:
+    """base14: тот же документ — замена проходит через подмену шрифта."""
+    source = _build_liberation_pdf(tmp_path / "liberation.pdf")
+    output = tmp_path / "out.pdf"
+
+    result = _replace_first(source, output, pdf_substitute_fonts="base14")
+
+    assert result["success"] is True, result["errors"]
+    assert result["replaced_count"] == 1
+    substituted = _warnings_of(result, "pdf_font_substituted")
+    assert len(substituted) == 1
+    assert "Liberation" in substituted[0]["original_font"]
+
+    with pymupdf.open(str(output)) as document:
+        text = document[0].get_text()
+    assert SUBSTITUTION_TEXT in text, text
+
+
+def test_always_succeeds_on_latex_subset(tmp_path: Path) -> None:
+    """LaTeX-сабсет Type0 без кириллицы: base14 отказывает, always — нет."""
+    source = _build_latex_subset_pdf(tmp_path / "latex.pdf")
+
+    strict_result = _replace_first(
+        source, tmp_path / "strict.pdf", pdf_substitute_fonts="strict"
+    )
+    base14_result = _replace_first(
+        source, tmp_path / "base14.pdf", pdf_substitute_fonts="base14"
+    )
+    always_result = _replace_first(
+        source, tmp_path / "always.pdf", pdf_substitute_fonts="always"
+    )
+
+    assert strict_result["success"] is False
+    assert base14_result["success"] is False, "base14 не должен подменять CID-сабсет"
+    assert always_result["success"] is True, always_result["errors"]
+    assert always_result["replaced_count"] == 1
+
+    with pymupdf.open(str(tmp_path / "always.pdf")) as document:
+        assert SUBSTITUTION_TEXT in document[0].get_text()
+
+
+def test_substitution_preserves_line_height(tmp_path: Path) -> None:
+    """При подмене шрифта leading остаётся кегль × 1.2 (регрессия на stage 19)."""
+    source = _build_liberation_pdf(tmp_path / "liberation.pdf")
+    output = tmp_path / "out.pdf"
+
+    result = _replace_first(source, output, pdf_substitute_fonts="base14")
+    assert result["success"] is True, result["errors"]
+
+    stream = _page_stream(output)
+    steps = [abs(float(m.group(2))) for m in re.finditer(r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Td", stream)]
+    assert steps, "переноса не было — тест не про то"
+    assert steps[0] == pytest.approx(14.4, abs=0.5), steps
+
+
+def _run_cli(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
+    """Вызвать CLI и вернуть (код, stdout, stderr)."""
+    from src.cli import main
+
+    code = main(argv)
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_preflight_in_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--json``: есть pdf_preflight с режимом и счётчиками."""
+    source = _build_liberation_pdf(tmp_path / "liberation.pdf")
+    output = tmp_path / "out.pdf"
+
+    code, out, _ = _run_cli(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--json",
+            "--pdf-substitute-fonts",
+            "base14",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["pdf_preflight"] is not None, payload
+    assert payload["pdf_preflight"]["mode"] == "base14"
+    assert payload["pdf_preflight"]["total"] >= 1
+
+
+def test_preflight_counts_match_actual(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Число в preflight совпадает с фактическими подменами."""
+    source = _build_liberation_pdf(tmp_path / "liberation.pdf")
+    output = tmp_path / "out.pdf"
+
+    code, out, _ = _run_cli(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--json",
+            "--pdf-substitute-fonts",
+            "base14",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    payload = json.loads(out)
+    substituted = [
+        item for item in payload["warnings"] if item.get("kind") == "pdf_font_substituted"
+    ]
+    assert payload["pdf_preflight"]["substitutable"] == len(substituted)
+    assert substituted
+
+
+def test_no_substitute_flag_aliases_strict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--no-pdf-substitute`` работает как strict (отказ на не-base-14)."""
+    source = _build_liberation_pdf(tmp_path / "liberation.pdf")
+    output = tmp_path / "out.pdf"
+
+    code, out, _ = _run_cli(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--json",
+            "--no-pdf-substitute",
+        ],
+        capsys,
+    )
+
+    payload = json.loads(out)
+    assert payload["pdf_preflight"]["mode"] == "strict"
+    assert code == 1, "strict должен дать ошибку обработки"
+
+
+def test_conflict_flags_exit_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--pdf-substitute-fonts=base14`` + ``--no-pdf-substitute`` → exit=2."""
+    source = _build_liberation_pdf(tmp_path / "liberation.pdf")
+    output = tmp_path / "out.pdf"
+
+    code, _, err = _run_cli(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--pdf-substitute-fonts",
+            "base14",
+            "--no-pdf-substitute",
+        ],
+        capsys,
+    )
+
+    assert code == 2
+    assert "no-pdf-substitute" in err
+
 

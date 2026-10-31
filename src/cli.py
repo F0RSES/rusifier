@@ -45,6 +45,7 @@ from .document_processor import (
     UnsupportedFormatError,
 )
 from .glossary_manager import GlossaryError, GlossaryManager
+from .pdf_fonts import FONT_SUBSTITUTION_MODES
 from .replacement_engine import ReplacementEngine
 
 __all__ = [
@@ -234,6 +235,21 @@ def build_parser() -> argparse.ArgumentParser:
             f"(по умолчанию {DEFAULT_PDF_MIN_FONT_SIZE})"
         ),
     )
+    parser.add_argument(
+        "--pdf-substitute-fonts",
+        choices=FONT_SUBSTITUTION_MODES,
+        default="strict",
+        help=(
+            "когда подменять шрифт блока на встроенный DejaVu: strict — только "
+            "base-14 (по умолчанию); base14 — ещё и при ошибке кодирования у "
+            "не-base-14; always — при любой ошибке кодирования"
+        ),
+    )
+    parser.add_argument(
+        "--no-pdf-substitute",
+        action="store_true",
+        help="алиас --pdf-substitute-fonts=strict (несовместим с base14/always)",
+    )
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument(
         "--verbose",
@@ -288,6 +304,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--pdf-line-height должен быть > 0, получено %s", args.pdf_line_height
         )
         return EXIT_INVALID_ARGS
+    if args.no_pdf_substitute and args.pdf_substitute_fonts != "strict":
+        LOGGER.error(
+            "--no-pdf-substitute несовместим с --pdf-substitute-fonts=%s",
+            args.pdf_substitute_fonts,
+        )
+        return EXIT_INVALID_ARGS
+    if args.no_pdf_substitute:
+        args.pdf_substitute_fonts = "strict"
 
     try:
         glossary = GlossaryManager(args.glossary, args.exceptions)
@@ -309,6 +333,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         pdf_line_height=args.pdf_line_height,
         pdf_fit=args.pdf_fit,
         pdf_min_font_size=args.pdf_min_font_size,
+        pdf_substitute_fonts=args.pdf_substitute_fonts,
     )
 
     input_path = Path(args.input).expanduser()
@@ -420,17 +445,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001 - граница CLI: наружу только код возврата
         return _emit_error(f"Не удалось применить замены: {exc}", None, json_mode)
 
+    pdf_warnings = [item for item in (result.get("warnings") or []) if isinstance(item, dict)]
+    pdf_overflow_count = sum(
+        1 for item in pdf_warnings if item.get("kind") == "pdf_overflow"
+    )
+    preflight = next(
+        (item for item in pdf_warnings if item.get("kind") == "pdf_preflight"), None
+    )
+    pdf_preflight = (
+        {
+            "substitutable": preflight.get("substitutable", 0),
+            "total": preflight.get("total", 0),
+            "mode": preflight.get("mode", args.pdf_substitute_fonts),
+        }
+        if preflight is not None
+        else None
+    )
+
     if not result["success"]:
         return _emit_error(
             f"Результат не записан: {output_path}",
             result["errors"],
             json_mode,
+            extra={
+                "warnings": warnings + pdf_warnings,
+                "pdf_overflow_count": pdf_overflow_count,
+                "pdf_preflight": pdf_preflight,
+            },
         )
 
-    pdf_warnings = [item for item in (result.get("warnings") or []) if isinstance(item, dict)]
-    pdf_overflow_count = sum(
-        1 for item in pdf_warnings if item.get("kind") == "pdf_overflow"
-    )
 
     for warning in warnings:
         LOGGER.warning("%s", warning)
@@ -466,6 +509,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "changes": changes,
                     "warnings": warnings + pdf_warnings,
                     "pdf_overflow_count": pdf_overflow_count,
+                    "pdf_preflight": pdf_preflight,
                 },
                 ensure_ascii=False,
             )
@@ -807,6 +851,7 @@ def _emit_error(
     message: str,
     errors: Sequence[dict] | None,
     json_mode: bool,
+    extra: dict | None = None,
 ) -> int:
     """Залогировать ошибку и, при ``--json``, отдать квитанцию об ошибке.
 
@@ -814,6 +859,8 @@ def _emit_error(
         message: Короткое описание проблемы.
         errors: Ошибки по блокам (``{"block_id": ..., "message": ...}``).
         json_mode: Печатать ли JSON в stdout.
+        extra: Дополнительные поля квитанции (например, ``pdf_preflight``) —
+            в отказе они объясняют причину лучше, чем текст ошибки.
 
     Returns:
         int: всегда :data:`EXIT_PROCESSING_ERROR`.
@@ -831,6 +878,8 @@ def _emit_error(
             "error": message,
             "errors": list(errors) if errors else [{"block_id": None, "message": message}],
         }
+        if extra:
+            payload.update(extra)
         _write_stdout(json.dumps(payload, ensure_ascii=False) + "\n")
     return EXIT_PROCESSING_ERROR
 

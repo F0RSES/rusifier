@@ -32,11 +32,14 @@ import pikepdf
 __all__ = [
     "CYRILLIC_RE",
     "DEFAULT_FONT_DIR",
+    "FONT_SUBSTITUTION_MODES",
     "MISSING_FONT_MESSAGE",
     "PdfFontResolver",
+    "PdfFontStrategy",
     "add_cyrillic_font",
     "build_type0_font",
     "is_base14_font",
+    "is_encode_error",
     "repair_inherited_font",
     "text_has_cyrillic",
 ]
@@ -119,6 +122,168 @@ def is_base14_font(name: str | None) -> bool:
         if lowered.startswith(alias.lower()):
             return True
     return False
+
+
+#: Допустимые режимы подмены шрифта в PDF (``--pdf-substitute-fonts``).
+#:
+#: * ``strict`` — подменяем только base-14 (поведение по умолчанию);
+#: * ``base14`` — strict + подмена, если движок не смог закодировать текст
+#:   не-base-14 шрифтом;
+#: * ``always`` — подмена при любой ошибке кодирования.
+FONT_SUBSTITUTION_MODES = ("strict", "base14", "always")
+
+
+def is_encode_error(message: str | None) -> bool:
+    """Похоже ли сообщение движка на «шрифт не может закодировать текст».
+
+    Движок сообщает об этом по-разному: ``"Font cannot encode text and no
+    extensible (Type0/Identity-H) font available in bbox"`` для не-CID шрифтов,
+    ``"Font extension failed for body font 'X' (missing: [...])"`` для сабсетов
+    Type0, а в наш ``errors`` попадает ещё и русская строка «в шрифте нет глифов».
+
+    Args:
+        message: Текст ошибки/предупреждения движка либо ``None``.
+
+    Returns:
+        bool: ``True``, если это ошибка кодирования.
+
+    Raises:
+        Ничего не бросает.
+    """
+    if not message:
+        return False
+    lowered = str(message).lower()
+    markers = (
+        "cannot encode",
+        "extension failed",
+        "no extensible",
+        "glyphs_missing",
+        "нет глифов",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+class PdfFontStrategy:
+    """Решает, можно ли подменить шрифт блока нашим CID-шрифтом.
+
+    Режимы (``mode``):
+
+    * ``strict`` — подмена только для base-14 (как было до появления режимов:
+      такой шрифт — Type1 без ``/FontDescriptor``, расширить его нельзя);
+    * ``base14`` — strict + подмена не-base-14 шрифта, если движок ответил
+      ошибкой кодирования (LibreOffice/Liberation и подобное);
+    * ``always`` — подмена при любой ошибке кодирования, независимо от типа
+      шрифта (LaTeX-сабсеты Type0 без кириллических глифов).
+
+    Args:
+        mode: Один из :data:`FONT_SUBSTITUTION_MODES`.
+        resolver: Резолвер кириллических TTF (для проверки, что шрифт есть).
+
+    Raises:
+        ValueError: неизвестный режим.
+    """
+
+    def __init__(self, mode: str, resolver: PdfFontResolver) -> None:
+        """Создать стратегию подмены.
+
+        Args:
+            mode: ``"strict"``, ``"base14"`` или ``"always"``.
+            resolver: Резолвер шрифтов с кириллицей.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: если ``mode`` неизвестен.
+        """
+        if mode not in FONT_SUBSTITUTION_MODES:
+            raise ValueError(
+                f"mode должен быть одним из {FONT_SUBSTITUTION_MODES}, получено {mode!r}"
+            )
+        self.mode = mode
+        self.resolver = resolver
+
+    def is_base14(self, block: Any, base_font: str | None = None) -> bool:
+        """Является ли шрифт блока base-14-совместимым.
+
+        Args:
+            block: ``TextBlock`` (используется ``font_name`` как фолбэк).
+            base_font: ``/BaseFont`` из ресурсов страницы, если уже известен.
+
+        Returns:
+            bool: ``True`` для Helvetica/Times/Courier/их алиасов.
+
+        Raises:
+            Ничего не бросает.
+        """
+        candidate = base_font if base_font is not None else getattr(block, "font_name", None)
+        return is_base14_font(candidate)
+
+    def should_substitute(
+        self,
+        block: Any,
+        new_text: str,
+        edit_result_or_none: Any | None,
+        *,
+        base_font: str | None = None,
+        font_subtype: str | None = None,
+    ) -> tuple[bool, str]:
+        """Нужно ли подменить шрифт блока и почему.
+
+        Вызывается дважды за блок: до правки (``edit_result_or_none is None`` —
+        preflight: подмена нужна, если шрифт base-14) и после неудачной правки
+        (по сообщению движка).
+
+        ``base14`` подменяет только «простые» шрифты (``/Type1``, ``/TrueType``):
+        их движок не умеет расширять вообще. CID-сабсет (``/Type0``) движок
+        хотя бы пытается расширить — для него нужен ``always``.
+
+        Args:
+            block: ``TextBlock`` блока.
+            new_text: Новый текст (для сообщения о причине).
+            edit_result_or_none: ``EditResult`` неудачной правки либо ``None``
+                для preflight.
+            base_font: ``/BaseFont`` шрифта блока (если известен точнее имени
+                ресурса).
+            font_subtype: ``/Subtype`` шрифта (``/Type0``, ``/Type1``,
+                ``/TrueType``), если известен.
+
+        Returns:
+            tuple[bool, str]: (нужно ли подменять, причина человеческим языком).
+
+        Raises:
+            Ничего не бросает.
+        """
+        base14 = self.is_base14(block, base_font)
+        if edit_result_or_none is None:
+            if base14:
+                return True, f"шрифт {base_font or block.font_name} base-14 — нужен CID-шрифт"
+            return False, f"шрифт {base_font or block.font_name} не base-14 — подмена не требуется"
+
+        message = getattr(edit_result_or_none, "warnings", None) or []
+        detail = " ".join(str(item) for item in message)
+        missing = getattr(
+            getattr(edit_result_or_none, "fidelity_report", None), "glyphs_missing", None
+        )
+        if missing:
+            detail += " " + " ".join(str(char) for char in missing)
+        if not is_encode_error(detail):
+            return False, "движок не сообщил об ошибке кодирования"
+
+        font_label = base_font or block.font_name
+        if self.mode == "strict":
+            return False, f"strict: подмена {font_label} запрещена"
+        if self.mode == "base14":
+            if base14:
+                return False, f"base14: шрифт {font_label} уже base-14, подмена не помогла"
+            if font_subtype == "/Type0":
+                return False, (
+                    f"base14: {font_label} — CID-сабсет, расширяется движком; "
+                    "для подмены нужен режим always"
+                )
+            return True, f"base14: шрифт {font_label} не может закодировать текст"
+        return True, f"always: подмена {font_label} при ошибке кодирования"
+
 
 
 def _style_from_name(name: str | None) -> str:

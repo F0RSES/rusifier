@@ -17,6 +17,7 @@ from src.document_processor import DocumentProcessor
 from src.pdf_fonts import (
     DEFAULT_FONT_DIR,
     PdfFontResolver,
+    PdfFontStrategy,
     is_base14_font,
     repair_inherited_font,
     text_has_cyrillic,
@@ -282,6 +283,88 @@ def test_bundled_files_exist() -> None:
         path = PROJECT_ROOT / "data" / "fonts" / name
         assert path.is_file(), f"нет {path}"
         assert path.stat().st_size > 100_000
+
+
+def _fake_edit(message: str, glyphs_missing: list[str] | None = None):
+    """Сырой ``EditResult``-подобный объект для юнит-тестов стратегии."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        success=False,
+        warnings=[message],
+        fidelity_report=SimpleNamespace(glyphs_missing=glyphs_missing or []),
+    )
+
+
+def _strategy(mode: str) -> PdfFontStrategy:
+    """Стратегия с резолвером по умолчанию."""
+    return PdfFontStrategy(mode, PdfFontResolver())
+
+
+def _block(font_name: str, font_size: float = 12.0):
+    """Минимальный ``TextBlock``-подобный объект."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(font_name=font_name, font_size=font_size)
+
+
+def test_strategy_strict_only_base14() -> None:
+    """strict: подмена только для base-14, на ошибку кодирования не реагирует."""
+    strategy = _strategy("strict")
+    encode_error = _fake_edit(
+        "Font cannot encode text and no extensible (Type0/Identity-H) font available in bbox"
+    )
+
+    # base-14 без ошибки — подмена нужна (prepare-фаза)
+    assert strategy.should_substitute(_block("Helvetica"), "текст", None, base_font="/Helvetica")[0]
+    # не-base-14 без ошибки — не нужна
+    assert not strategy.should_substitute(
+        _block("LiberationSerif"), "текст", None, base_font="/LiberationSerif"
+    )[0]
+    # ошибка кодирования у не-base-14 при strict — запрещено
+    allowed, reason = strategy.should_substitute(
+        _block("LiberationSerif"), "текст", encode_error, base_font="/LiberationSerif"
+    )
+    assert allowed is False
+    assert "strict" in reason
+
+
+def test_strategy_base14_allows_non_base14_on_encode_error() -> None:
+    """base14: не-base-14 + ошибка кодирования → подмена разрешена."""
+    strategy = _strategy("base14")
+    encode_error = _fake_edit("Font extension failed for body font 'F1' (missing: ['Д'])")
+
+    allowed, reason = strategy.should_substitute(
+        _block("F1"), "Д", encode_error, base_font="/ABCDEF+LiberationSerif"
+    )
+
+    assert allowed is True
+    assert "base14" in reason
+
+
+def test_strategy_always_allows_all_on_encode_error() -> None:
+    """always: подмена и для base-14 при ошибке кодирования."""
+    strategy = _strategy("always")
+    encode_error = _fake_edit("Font cannot encode text", glyphs_missing=["Д"])
+
+    allowed, reason = strategy.should_substitute(
+        _block("F1"), "Д", encode_error, base_font="/Helvetica"
+    )
+
+    assert allowed is True
+    assert "always" in reason
+
+
+def test_strategy_respects_no_error_means_no_substitution() -> None:
+    """Без ошибки кодирования подмена не предлагается ни в одном режиме."""
+    success_like = _fake_edit("Overflow detected: replacement extends past available space.")
+
+    for mode in ("strict", "base14", "always"):
+        allowed, reason = _strategy(mode).should_substitute(
+            _block("F1"), "текст", success_like, base_font="/LiberationSerif"
+        )
+        assert allowed is False, mode
+        assert "кодирования" in reason
 
 
 def test_license_file_present() -> None:

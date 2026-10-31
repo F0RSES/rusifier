@@ -113,6 +113,33 @@ Arial, Times New Roman — в том числе встроенным сабсе�
 "block_id": …, "overflow_pt": …}` и счётчик `pdf_overflow_count`; в stderr — одна строка
 `PDF: N блоков с переполнением (детали в --json)`.
 
+### Подмена шрифта (`--pdf-substitute-fonts`)
+
+Если шрифт документа не может закодировать кириллицу, TermRu по умолчанию **отказывает** по этому
+блоку (файл не портится). Opt-in режимы подставляют встроенный DejaVu:
+
+| Режим | base-14 | LibreOffice / LaTeX | Вёрстка |
+|---|---|---|---|
+| `strict` (по умолчанию) | работает | отказ, файл цел | 100 % |
+| `base14` | работает | простые шрифты (`/Type1`, `/TrueType`): работает, DejaVu вместо Liberation | гарнитура блока меняется; переносы держит `--pdf-line-height` |
+| `always` | работает | всё, включая CID-сабсеты (LaTeX `Type0`): DejaVu везде | то же |
+
+```bash
+# LibreOffice/Word-экспорт с TrueType-сабсетами без кириллицы
+termru --input report.pdf --pdf-substitute-fonts base14
+
+# LaTeX (pdfTeX/dvipdfmx): CID-сабсет без кириллических глифов
+termru --input paper.pdf --pdf-substitute-fonts always
+```
+
+`--no-pdf-substitute` — алиас `strict` (несовместим с `base14`/`always`, exit 2). До правок
+считается preflight: `pdf_preflight: {"substitutable": N, "total": M, "mode": …}` в `--json` и
+одна строка INFO в stderr. Каждая подмена попадает в `warnings` как
+`{"kind": "pdf_font_substituted", "block_id", "original_font", "reason"}`.
+
+**Рекомендация.** По умолчанию — `strict`. Для LibreOffice/LaTeX используйте `base14`; `always` —
+только если понимаете, что гарнитура блока будет заменена на DejaVu.
+
 ## Структура проекта
 
 ```

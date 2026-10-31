@@ -59,10 +59,13 @@ from polydoc.model import CodeBlock, Image, Inline, Slide, Table, Text
 from polydoc.model.inline import iter_text_nodes, merge_runs
 
 from .pdf_fonts import (
+    FONT_SUBSTITUTION_MODES,
     MISSING_FONT_MESSAGE,
     PdfFontResolver,
+    PdfFontStrategy,
     add_cyrillic_font,
     is_base14_font,
+    is_encode_error,
     repair_inherited_font,
     text_has_cyrillic,
 )
@@ -187,6 +190,9 @@ class _PdfEngineNoiseCounter(logging.Handler):
         """
         super().__init__(level=logging.WARNING)
         self.count = 0
+        #: Состояние логгера до подавления (для корректного вложенного restore).
+        self.previous_propagate = True
+        self.previous_handlers: list[logging.Handler] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         """Учесть одно предупреждение и не выводить его.
@@ -217,6 +223,8 @@ def _suppress_pdf_engine_noise() -> _PdfEngineNoiseCounter:
     """
     logger = logging.getLogger(_PDF_ENGINE_LOGGER)
     counter = _PdfEngineNoiseCounter()
+    counter.previous_propagate = logger.propagate
+    counter.previous_handlers = list(logger.handlers)
     logger.addHandler(counter)
     logger.propagate = False
     return counter
@@ -236,7 +244,8 @@ def _restore_pdf_engine_logging(counter: _PdfEngineNoiseCounter) -> None:
     """
     logger = logging.getLogger(_PDF_ENGINE_LOGGER)
     logger.removeHandler(counter)
-    logger.propagate = True
+    logger.propagate = counter.previous_propagate
+    logger.handlers = counter.previous_handlers
 
 
 @dataclass
@@ -408,6 +417,7 @@ class DocumentProcessor:
         pdf_line_height: float = DEFAULT_PDF_LINE_HEIGHT,
         pdf_fit: str = "none",
         pdf_min_font_size: float = DEFAULT_PDF_MIN_FONT_SIZE,
+        pdf_substitute_fonts: str = "strict",
     ) -> None:
         """Создать процессор документов.
 
@@ -429,13 +439,18 @@ class DocumentProcessor:
             pdf_min_font_size: Нижняя граница кегля для ``fit="shrink"``; если
                 движок уменьшил сильнее, правка повторяется без shrink
                 (``--pdf-min-font-size``).
+            pdf_substitute_fonts: Когда подменять шрифт блока нашим CID:
+                ``"strict"`` (по умолчанию) — только base-14; ``"base14"`` —
+                ещё и не-base-14 при ошибке кодирования; ``"always"`` — при
+                любой ошибке кодирования (``--pdf-substitute-fonts``).
 
         Returns:
             None
 
         Raises:
-            ValueError: неизвестное значение ``pdf_fallback``/``pdf_fit`` либо
-                неположительный ``pdf_line_height``/``pdf_min_font_size``.
+            ValueError: неизвестное значение ``pdf_fallback``/``pdf_fit``/
+                ``pdf_substitute_fonts`` либо неположительный
+                ``pdf_line_height``/``pdf_min_font_size``.
         """
         if pdf_fallback not in ("fail", "polydoc"):
             raise ValueError(
@@ -451,6 +466,11 @@ class DocumentProcessor:
             raise ValueError(
                 f"pdf_min_font_size должен быть > 0, получено {pdf_min_font_size!r}"
             )
+        if pdf_substitute_fonts not in FONT_SUBSTITUTION_MODES:
+            raise ValueError(
+                "pdf_substitute_fonts должен быть одним из "
+                f"{FONT_SUBSTITUTION_MODES}, получено {pdf_substitute_fonts!r}"
+            )
         self._log_callback = log_callback
         self._pdf_font_dir = Path(pdf_font_dir) if pdf_font_dir else None
         self._pdf_fallback = pdf_fallback
@@ -458,7 +478,10 @@ class DocumentProcessor:
         self._pdf_line_height = float(pdf_line_height)
         self._pdf_fit = pdf_fit
         self._pdf_min_font_size = float(pdf_min_font_size)
+        self._pdf_substitute_fonts = pdf_substitute_fonts
         self._pdf_warnings: list[dict] = []
+        self._base_font_cache: dict[tuple[int, str], str | None] = {}
+        self._font_subtype_cache: dict[tuple[int, str], str | None] = {}
         self._font_resolver: PdfFontResolver | None = None
 
     @property
@@ -711,6 +734,8 @@ class DocumentProcessor:
         # Предупреждения копятся в процессоре: PDF-правки добавляют записи
         # структурированно (kind/block_id/…), вызывающий код фильтрует их по kind.
         self._pdf_warnings = []
+        self._base_font_cache = {}
+        self._font_subtype_cache = {}
         warnings: list[dict] = self._pdf_warnings
         result: dict = {
             "success": False,
@@ -1164,6 +1189,35 @@ class DocumentProcessor:
             for block_id in missing:
                 pending.pop(block_id, None)
 
+            substitutable, total, exact = self._preflight_substitution(
+                engine, prepared, pending, by_id, resources, Path(tmp_dir)
+            )
+            if total:
+                mode = self._pdf_substitute_fonts
+                if mode == "strict":
+                    tail = "strict: такие блоки получат отказ"
+                else:
+                    tail = f"{mode}: такие блоки будут записаны с подменой шрифта"
+                note = "" if exact else " (оценка по типу шрифта)"
+                self._pdf_warnings.append(
+                    {
+                        "kind": "pdf_preflight",
+                        "substitutable": substitutable,
+                        "total": total,
+                        "mode": mode,
+                        "exact": exact,
+                        "message": (
+                            f"PDF preflight{note}: подмена шрифта потребуется для "
+                            f"{substitutable} из {total} блоков ({tail})"
+                        ),
+                    }
+                )
+                self._log(
+                    "info",
+                    f"PDF preflight: подмена шрифта потребуется для "
+                    f"{substitutable} из {total} блоков (режим {mode})",
+                )
+
             current = prepared
             for step, block_id in enumerate(sorted(pending, reverse=True)):
                 new_text = pending[block_id]
@@ -1342,6 +1396,98 @@ class DocumentProcessor:
         except (KeyError, IndexError, TypeError, AttributeError, ValueError):
             return None
 
+    @property
+    def font_strategy(self) -> PdfFontStrategy:
+        """Стратегия подмены шрифта (``--pdf-substitute-fonts``).
+
+        Returns:
+            PdfFontStrategy: объект с режимом ``strict``/``base14``/``always``.
+
+        Raises:
+            Ничего не бросает.
+        """
+        return PdfFontStrategy(self._pdf_substitute_fonts, self.font_resolver)
+
+    def _base_font_for(self, pdf_path: Path, block: Any) -> str | None:
+        """``/BaseFont`` шрифта блока (с кэшем на документ).
+
+        Args:
+            pdf_path: PDF, в котором ищется ресурс.
+            block: ``TextBlock`` блока.
+
+        Returns:
+            str | None: например ``/ABCDEF+LiberationSerif`` или ``None``.
+
+        Raises:
+            Ничего не бросает.
+        """
+        key = (int(block.page), str(block.font_name))
+        if key in self._base_font_cache:
+            return self._base_font_cache[key]
+        value: str | None = None
+        try:
+            with pikepdf.open(str(pdf_path)) as pdf:
+                fonts = pdf.pages[int(block.page)].get("/Resources", {}).get("/Font", {})
+                resource = pikepdf.Name(f"/{str(block.font_name).lstrip('/')}")
+                font = fonts.get(resource)
+                if font is not None:
+                    base = font.get("/BaseFont")
+                    value = str(base) if base is not None else None
+        except Exception:  # noqa: BLE001 - отсутствие ресурса не ломает правку
+            value = None
+        self._base_font_cache[key] = value
+        return value
+
+    def _inject_cid_font(
+        self,
+        current: Path,
+        block: Any,
+        new_text: str,
+        target: Path,
+        block_id: int,
+        base_font: str | None,
+    ) -> str | None:
+        """Внедрить CID-шрифт в ресурсы страницы блока «на месте».
+
+        Нужно для режимов ``base14``/``always``: шрифт документа не может
+        закодировать кириллицу, поэтому подкладываем свой Type0/Identity-H уже
+        после первой неудачной попытки правки.
+
+        Args:
+            current: PDF, к которому применяется правка.
+            block: ``TextBlock`` блока.
+            new_text: Текст, который должен быть закодирован.
+            target: Куда сохранить PDF с внедрённым шрифтом.
+            block_id: Идентификатор блока (для имени ресурса и сообщений).
+            base_font: ``/BaseFont`` шрифта блока (для подбора начертания).
+
+        Returns:
+            str | None: имя ресурса (``TFSub{block_id}``) либо ``None``, если
+            подходящий TTF не найден.
+
+        Raises:
+            Ничего не бросает: сбой записи логируется и возвращает ``None``.
+        """
+        ttf = self.font_resolver.find_for_block(block, base_font)
+        if ttf is None:
+            ttf = self.font_resolver.find_any_cyrillic()
+        if ttf is None:
+            self._log("error", f"Блок {block_id}: {MISSING_FONT_MESSAGE}")
+            return None
+
+        name = f"TFSub{block_id}"
+        chars = "".join(sorted(set(new_text)))
+        try:
+            with pikepdf.open(str(current)) as pdf:
+                add_cyrillic_font(pdf, pdf.pages[int(block.page)], Path(ttf), chars, name)
+                pdf.save(str(target))
+        except Exception as exc:  # noqa: BLE001 - внедрение не должно ронять прогон
+            self._log(
+                "error", f"Блок {block_id}: не удалось внедрить кириллический шрифт: {exc}"
+            )
+            return None
+        return name
+
     def _replace_pdf_block(
         self,
         engine: Any,
@@ -1376,8 +1522,9 @@ class DocumentProcessor:
         """
         line_height = self._block_line_height(block)
         fit = self._pdf_fit
+        base_font = self._base_font_for(current, block)
 
-        edit = self._call_replace_block(
+        edit, raw = self._call_replace_block(
             engine,
             current,
             block,
@@ -1385,13 +1532,28 @@ class DocumentProcessor:
             new_text,
             target,
             block_id,
-            errors,
             font_name=font_name,
             line_height=line_height,
             fit=fit,
         )
         if edit is None:
-            return None
+            edit, raw, font_name = self._retry_with_substitution(
+                engine,
+                current,
+                block,
+                bbox,
+                new_text,
+                target,
+                block_id,
+                errors,
+                font_name=font_name,
+                line_height=line_height,
+                fit=fit,
+                base_font=base_font,
+                raw=raw,
+            )
+            if edit is None:
+                return None
 
         if fit == "shrink":
             applied = self._applied_font_size(edit, block)
@@ -1413,7 +1575,7 @@ class DocumentProcessor:
                         ),
                     }
                 )
-                edit = self._call_replace_block(
+                edit, raw = self._call_replace_block(
                     engine,
                     current,
                     block,
@@ -1421,18 +1583,25 @@ class DocumentProcessor:
                     new_text,
                     target,
                     block_id,
-                    errors,
                     font_name=font_name,
                     line_height=line_height,
                     fit="none",
                 )
                 if edit is None:
+                    detail = (
+                        self._describe_pdf_edit(raw)
+                        if raw is not None
+                        else "причина не сообщена"
+                    )
+                    message = f"Движок не смог заменить текст блока {block_id}: {detail}"
+                    self._log("error", message)
+                    errors.append({"block_id": block_id, "message": message})
                     return None
 
         self._collect_overflow(edit, block_id)
         return edit
 
-    def _call_replace_block(
+    def _retry_with_substitution(
         self,
         engine: Any,
         current: Path,
@@ -1446,8 +1615,234 @@ class DocumentProcessor:
         font_name: str | None,
         line_height: float | None,
         fit: str,
-    ) -> Any | None:
-        """Вызвать ``replace_block`` с нашими параметрами и разобрать результат.
+        base_font: str | None,
+        raw: Any | None,
+    ) -> tuple[Any | None, Any | None, str | None]:
+        """Повторить правку с подменой шрифта на CID (режимы ``base14``/``always``).
+
+        Args:
+            engine: Модуль ``pdf_edit_engine``.
+            current: PDF, к которому применяется правка.
+            block: ``TextBlock`` блока.
+            bbox: Координаты ``(x0, y0, x1, y1)``.
+            new_text: Новый текст блока.
+            target: Путь для результата шага.
+            block_id: Идентификатор блока.
+            errors: Список ошибок, который дополняется при неудаче.
+            font_name: Шрифт первой попытки (``None`` — шрифт документа).
+            line_height: Межстрочный интервал (нужен и при подмене: DejaVu шире).
+            fit: ``"none"`` или ``"shrink"``.
+            base_font: ``/BaseFont`` шрифта блока.
+            raw: ``EditResult`` неудачной первой попытки (может быть ``None``).
+
+        Returns:
+            tuple[Any | None, Any | None, str | None]: (успешный ``EditResult``,
+            сырой результат повтора, имя ресурса). Первый элемент ``None``,
+            если подмена не разрешена или не удалась.
+
+        Raises:
+            Ничего не бросает: ошибки попадают в ``errors``.
+        """
+        strategy = self.font_strategy
+        should, reason = strategy.should_substitute(
+            block,
+            new_text,
+            raw,
+            base_font=base_font,
+            font_subtype=self._font_subtype(current, block),
+        )
+        detail = (
+            self._describe_pdf_edit(raw) if raw is not None else "причина не сообщена"
+        )
+        message = f"Движок не смог заменить текст блока {block_id}: {detail}"
+        if not should or not text_has_cyrillic(new_text):
+            self._log("error", f"{message} ({reason})")
+            errors.append({"block_id": block_id, "message": message})
+            return None, raw, font_name
+
+        injected = target.with_name(f"{target.stem}-font{target.suffix}")
+        name = self._inject_cid_font(current, block, new_text, injected, block_id, base_font)
+        if name is None:
+            errors.append({"block_id": block_id, "message": message})
+            return None, raw, font_name
+
+        edit, raw_retry = self._call_replace_block(
+            engine,
+            injected,
+            block,
+            bbox,
+            new_text,
+            target,
+            block_id,
+            font_name=name,
+            line_height=line_height,
+            fit=fit,
+        )
+        if edit is None:
+            retry_detail = (
+                self._describe_pdf_edit(raw_retry)
+                if raw_retry is not None
+                else "причина не сообщена"
+            )
+            message = (
+                f"Движок не смог заменить текст блока {block_id} "
+                f"с подменой шрифта: {retry_detail}"
+            )
+            self._log("error", message)
+            errors.append({"block_id": block_id, "message": message})
+            return None, raw_retry, font_name
+
+        original = base_font or str(block.font_name)
+        self._log("info", f"Блок {block_id}: шрифт {original} подменён на /{name} ({reason})")
+        self._pdf_warnings.append(
+            {
+                "kind": "pdf_font_substituted",
+                "block_id": block_id,
+                "original_font": original,
+                "replacement": name,
+                "reason": reason,
+                "message": f"Шрифт {original} заменён на /{name}: {reason}",
+            }
+        )
+        return edit, raw_retry, name
+
+    def _preflight_substitution(
+        self,
+        engine: Any,
+        prepared: Path,
+        pending: dict[int, str],
+        by_id: Mapping[int, _TextUnit],
+        resources: Mapping[int, str],
+        tmp_dir: Path,
+        *,
+        limit: int = 25,
+    ) -> tuple[int, int, bool]:
+        """Оценить, для скольких блоков потребуется подмена шрифта.
+
+        Пока блоков немного, делается честный «сухой» прогон ``replace_block``
+        во временный файл: он точно повторяет логику движка. Если блоков больше
+        ``limit`` — используется оценка по типу шрифта (не ``Type0`` → подмена
+        понадобится), чтобы не платить записью PDF за каждый блок.
+
+        Args:
+            engine: Модуль ``pdf_edit_engine``.
+            prepared: PDF с уже внедрёнными base-14 шрифтами.
+            pending: Замены ``{block_id: новый текст}``.
+            by_id: Блоки по ``block_id``.
+            resources: ``{block_id: имя ресурса}`` для base-14 блоков.
+            tmp_dir: Каталог для пробных файлов.
+            limit: Максимум блоков для точного прогона.
+
+        Returns:
+            tuple[int, int, bool]: (сколько блоков потребует подмены, всего
+            блоков с кириллицей, была ли оценка точной).
+
+        Raises:
+            Ничего не бросает: сбой пробы считается «подмена потребуется».
+        """
+        candidates = [
+            (block_id, text)
+            for block_id, text in sorted(pending.items())
+            if block_id in by_id and text_has_cyrillic(text)
+        ]
+        total = len(candidates)
+        if not total:
+            return 0, 0, True
+
+        if total <= limit:
+            probe_path = tmp_dir / "preflight.pdf"
+            substitutable = 0
+            # Пробы — служебный проход: их внутренние предупреждения движка не
+            # должны попадать ни в stderr, ни в счётчик «подавлено» — иначе
+            # пользователь видит завышенное число.
+            engine_logger = logging.getLogger(_PDF_ENGINE_LOGGER)
+            previous_level = engine_logger.level
+            engine_logger.setLevel(logging.CRITICAL)
+            try:
+                for block_id, text in candidates:
+                    unit = by_id[block_id]
+                    block = unit.node
+                    bbox = (
+                        float(block.x),
+                        float(block.y),
+                        float(block.x + block.width),
+                        float(block.y + block.height),
+                    )
+                    edit, raw = self._call_replace_block(
+                        engine,
+                        prepared,
+                        block,
+                        bbox,
+                        text,
+                        probe_path,
+                        block_id,
+                        font_name=resources.get(block_id),
+                        line_height=self._block_line_height(block),
+                        fit="none",
+                    )
+                    if edit is not None:
+                        continue
+                    detail = self._describe_pdf_edit(raw) if raw is not None else ""
+                    if is_encode_error(detail):
+                        substitutable += 1
+            finally:
+                engine_logger.setLevel(previous_level)
+            return substitutable, total, True
+
+        substitutable = 0
+        for block_id, _text in candidates:
+            block = by_id[block_id].node
+            base_font = self._base_font_for(prepared, block)
+            if is_base14_font(base_font):
+                continue
+            if self._font_subtype(prepared, block) != "/Type0":
+                substitutable += 1
+        return substitutable, total, False
+
+    def _font_subtype(self, pdf_path: Path, block: Any) -> str | None:
+        """Подтип шрифта блока (``/Type0``, ``/Type1``, ``/TrueType``).
+
+        Args:
+            pdf_path: PDF-файл.
+            block: ``TextBlock`` блока.
+
+        Returns:
+            str | None: подтип или ``None``, если ресурс не найден.
+
+        Raises:
+            Ничего не бросает.
+        """
+        key = (int(block.page), str(block.font_name))
+        if key in self._font_subtype_cache:
+            return self._font_subtype_cache[key]
+        value: str | None = None
+        try:
+            with pikepdf.open(str(pdf_path)) as pdf:
+                fonts = pdf.pages[int(block.page)].get("/Resources", {}).get("/Font", {})
+                font = fonts.get(pikepdf.Name(f"/{str(block.font_name).lstrip('/')}"))
+                if font is not None:
+                    subtype = font.get("/Subtype")
+                    value = str(subtype) if subtype is not None else None
+        except Exception:  # noqa: BLE001 - отсутствие ресурса не ломает оценку
+            value = None
+        self._font_subtype_cache[key] = value
+        return value
+
+    def _call_replace_block(
+        self,
+        engine: Any,
+        current: Path,
+        block: Any,
+        bbox: tuple[float, float, float, float],
+        new_text: str,
+        target: Path,
+        block_id: int,
+        *,
+        font_name: str | None,
+        line_height: float | None,
+        fit: str,
+    ) -> tuple[Any | None, Any | None]:
+        """Вызвать ``replace_block`` и вернуть результат вместе с сырым ответом.
 
         Args:
             engine: Модуль ``pdf_edit_engine``.
@@ -1457,16 +1852,17 @@ class DocumentProcessor:
             new_text: Новый текст блока.
             target: Путь для результата шага.
             block_id: Идентификатор блока (для сообщения об ошибке).
-            errors: Список ошибок, который дополняется при неудаче.
             font_name: Ресурс внедрённого CID-шрифта или ``None``.
             line_height: Межстрочный интервал в пунктах или ``None``.
             fit: ``"none"`` или ``"shrink"``.
 
         Returns:
-            Any | None: ``EditResult`` при успехе, иначе ``None``.
+            tuple[Any | None, Any | None]: (успешный ``EditResult`` или ``None``,
+            сырой ``EditResult`` движка — нужен для решения о подмене шрифта).
 
         Raises:
-            Ничего не бросает: исключения движка логируются и попадают в ``errors``.
+            Ничего не бросает: исключения движка логируются и возвращают
+            ``(None, None)``.
         """
         try:
             edit = engine.replace_block(
@@ -1480,21 +1876,13 @@ class DocumentProcessor:
                 fit=fit,
             )
         except Exception as exc:  # noqa: BLE001 - один блок не ломает остальные
-            message = f"Не удалось заменить текст блока {block_id}: {exc}"
-            self._log("error", message)
-            errors.append({"block_id": block_id, "message": message})
-            return None
+            self._log("error", f"Не удалось заменить текст блока {block_id}: {exc}")
+            return None, None
 
         if not getattr(edit, "success", False):
-            message = (
-                f"Движок не смог заменить текст блока {block_id}: "
-                f"{self._describe_pdf_edit(edit)}"
-            )
-            self._log("error", message)
-            errors.append({"block_id": block_id, "message": message})
-            return None
+            return None, edit
 
-        return edit
+        return edit, edit
 
     def _block_line_height(self, block: Any) -> float | None:
         """Межстрочный интервал для перенесённых строк блока.

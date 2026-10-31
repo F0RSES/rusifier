@@ -228,13 +228,59 @@ base-14-совместимые шрифты (см. `is_base14_font`: семей�
 Отдельно стоит помнить про оформление: подмена всегда меняет гарнитуру блока (DejaVu вместо
 Helvetica/Times). Для чтения и поиска это неважно, для точной вёрстки — заметно.
 
-## 6. Как воспроизвести
+## 6. После `--pdf-substitute-fonts` (opt-in подмена шрифта)
+
+Реализовано: `PdfFontStrategy` (`strict` / `base14` / `always`), повтор правки с внедрённым
+CID-шрифтом (`/TFSub{block_id}`), preflight-оценка и структурные предупреждения.
+
+### 6.1 Пять проблемных PDF из §4
+
+Замена: первое слово первого блока с латиницей → «ДАННЫЕ».
+
+| Файл | strict | base14 | always | Причина отказа в strict |
+|---|---|---|---|---|
+| `shared-mime-info-spec.pdf` | отказ | **ok** | **ok** | `/TWYWUS+NimbusSanL-Bold` (Type1), нет глифов |
+| `samplepdf.pdf` | отказ | **ok** | **ok** | `/GMFNUY+CMR10` (Type1) |
+| `btxdoc.pdf` | отказ | **ok** | **ok** | `/VBBGSH+CMR17` (Type1) |
+| `lm-info.pdf` | отказ | **ok** | **ok** | `/JFTBPZ+LMMonoLt10-Regular` (Type1) |
+| `dvipdfmx.pdf` | отказ | отказ | **ok** | `/YSDERE+NewCM10-Regular-Identity-H` (Type0-сабсет) |
+
+Итог: **strict 0/5, base14 4/5 (≥3 по критерию), always 5/5 (≥4)**.
+
+Почему `base14` не берёт `dvipdfmx.pdf`: там CID-сабсет (`/Type0`), который движок хотя бы
+пытается расширить через `extend_subset`. `base14` подменяет только «простые» шрифты
+(`/Type1`, `/TrueType`), которые не расширяются в принципе; для CID-сабсетов нужен `always`.
+Это же разделение делает тест «LaTeX Type0: base14 отказ, always успех» осмысленным.
+
+### 6.2 Верстка после подмены
+
+| Проверка | Результат |
+|---|---|
+| Перекрытие строк вокруг замены (`fitz`, 5 PDF × 2 режима) | −12.8 … −0.9 pt (перекрытий нет) |
+| `pdf_overflow` при подмене | есть (DejaVu шире исходного шрифта) — **не подавляется** |
+| `Td` перенесённой строки | `14.4` = `12 × 1.2` (тест `test_substitution_preserves_line_height`) |
+| Пиксельная проверка (`shared-mime-info-spec.pdf`, длинная замена → 5 строк) | полосы `(30,85) (96,151) (164,211) (241,283)`; зазоры **10, 12, 3, 27 px**; макс. перекрытие **−0.89 pt** |
+
+Скриншот-сервис недоступен, поэтому визуальная часть подтверждена пиксельной метрикой: между
+строками с кириллицей есть пустые ряды пикселей, слитых полос нет.
+
+### 6.3 Сколько это стоит
+
+* Preflight делает «сухой» `replace_block` по каждому блоку с кириллицей, пока их ≤ 25; при большем
+  числе переключается на оценку по типу шрифта (поле `exact: false`), чтобы не писать PDF N раз.
+* Внутренние предупреждения движка во время проб подавляются уровнем логгера — счётчик
+  «N подавлено» и `--verbose` не завышаются.
+* Каждая подмена — отдельная запись PDF; на 50-страничном `dvipdfmx.pdf` это ~2 с на блок.
+
+## 7. Как воспроизвести
 
 ```bash
 cd termru
-.venv/bin/python -m pytest -q                      # 131 passed
+.venv/bin/python -m pytest -q                      # 163 passed
 .venv/bin/python -m pytest tests/test_pdf_realworld.py -v
 .venv/bin/python -m src.cli --input report.pdf --output report_ru.pdf --verbose
+.venv/bin/python -m src.cli --input paper.pdf --output paper_ru.pdf \
+    --pdf-substitute-fonts always
 ```
 
 Фикстуры harness создаются в `tests/fixtures/pdf/` при каждом прогоне и в git не попадают.
