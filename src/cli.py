@@ -264,6 +264,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     processor = DocumentProcessor(
         pdf_font_dir=args.pdf_font_dir,
         pdf_fallback=args.pdf_fallback,
+        pdf_engine_noise=args.verbose,
     )
 
     input_path = Path(args.input).expanduser()

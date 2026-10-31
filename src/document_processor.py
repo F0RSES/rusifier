@@ -146,6 +146,85 @@ class DocumentProcessingError(Exception):
     """
 
 
+#: Логгер библиотеки pdf_edit_engine (её подмодули — дочерние логгеры).
+_PDF_ENGINE_LOGGER = "pdf_edit_engine"
+
+
+class _PdfEngineNoiseCounter(logging.Handler):
+    """Считает и глушит внутренние предупреждения ``pdf_edit_engine``.
+
+    Библиотека пишет ``logger.warning("Font extension failed for %s", ...,
+    exc_info=True)`` (``structural.py:1196``), когда пытается расширить
+    base-14 шрифт, терпит неудачу и берёт подставленный CID-шрифт. Для нас это
+    штатный путь, но в stderr это выглядит как трейсбек на каждый блок.
+
+    Хендлер только считает записи: ``propagate=False`` на логгере не пускает их
+    в корневой обработчик, поэтому в stderr они не попадают.
+    """
+
+    def __init__(self) -> None:
+        """Создать счётчик предупреждений движка.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        super().__init__(level=logging.WARNING)
+        self.count = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Учесть одно предупреждение и не выводить его.
+
+        Args:
+            record: Запись логирования.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.count += 1
+
+
+def _suppress_pdf_engine_noise() -> _PdfEngineNoiseCounter:
+    """Перехватить предупреждения ``pdf_edit_engine``.
+
+    Уровни логгеров не меняются (иначе записи не дошли бы до хендлера);
+    достаточно отключить всплытие в корневой логгер и повесить счётчик.
+
+    Returns:
+        _PdfEngineNoiseCounter: хендлер со счётчиком (нужен для восстановления).
+
+    Raises:
+        Ничего не бросает.
+    """
+    logger = logging.getLogger(_PDF_ENGINE_LOGGER)
+    counter = _PdfEngineNoiseCounter()
+    logger.addHandler(counter)
+    logger.propagate = False
+    return counter
+
+
+def _restore_pdf_engine_logging(counter: _PdfEngineNoiseCounter) -> None:
+    """Вернуть логирование ``pdf_edit_engine`` в исходное состояние.
+
+    Args:
+        counter: Хендлер, установленный :func:`_suppress_pdf_engine_noise`.
+
+    Returns:
+        None
+
+    Raises:
+        Ничего не бросает.
+    """
+    logger = logging.getLogger(_PDF_ENGINE_LOGGER)
+    logger.removeHandler(counter)
+    logger.propagate = True
+
+
 @dataclass
 class _TextUnit:
     """Внутреннее представление текстового блока документа.
@@ -311,6 +390,7 @@ class DocumentProcessor:
         *,
         pdf_font_dir: str | Path | None = None,
         pdf_fallback: str = "fail",
+        pdf_engine_noise: bool = False,
     ) -> None:
         """Создать процессор документов.
 
@@ -322,6 +402,8 @@ class DocumentProcessor:
             pdf_fallback: Что делать, если кириллический шрифт не найден:
                 ``"fail"`` — ошибка по блоку, ``"polydoc"`` — пересобрать PDF
                 через polydoc (вёрстка теряется).
+            pdf_engine_noise: ``True`` — не подавлять внутренние предупреждения
+                ``pdf_edit_engine`` (их трейсбеки полезны с ``--verbose``).
 
         Returns:
             None
@@ -336,6 +418,7 @@ class DocumentProcessor:
         self._log_callback = log_callback
         self._pdf_font_dir = Path(pdf_font_dir) if pdf_font_dir else None
         self._pdf_fallback = pdf_fallback
+        self._pdf_engine_noise = bool(pdf_engine_noise)
         self._font_resolver: PdfFontResolver | None = None
 
     @property
@@ -924,6 +1007,46 @@ class DocumentProcessor:
         if engine is None:
             raise DocumentProcessingError("pdf_edit_engine недоступен для записи PDF")
 
+        counter = None if self._pdf_engine_noise else _suppress_pdf_engine_noise()
+        try:
+            applied, errors = self._run_pdf_engine(
+                engine, units, replacements, src, dst
+            )
+        finally:
+            if counter is not None:
+                _restore_pdf_engine_logging(counter)
+
+        if counter is not None and counter.count:
+            self._log(
+                "warning",
+                f"PDF: {counter.count} внутренних предупреждений "
+                "pdf_edit_engine подавлено (используйте --verbose для деталей)",
+            )
+        return applied, errors
+
+    def _run_pdf_engine(
+        self,
+        engine: Any,
+        units: Sequence[_TextUnit],
+        replacements: dict[int, str],
+        src: Path,
+        dst: Path,
+    ) -> tuple[int, list[dict]]:
+        """Один проход правок PDF через ``pdf_edit_engine``.
+
+        Args:
+            engine: Модуль ``pdf_edit_engine``.
+            units: Блоки из ``extract_text``.
+            replacements: Нормализованные замены.
+            src: Исходный PDF.
+            dst: Файл результата.
+
+        Returns:
+            tuple[int, list[dict]]: (число изменённых блоков, ошибки по блокам).
+
+        Raises:
+            Exception: ошибки чтения/записи пробрасываются наверх.
+        """
         by_id = {unit.block_id: unit for unit in units}
         applied = 0
         errors: list[dict] = []

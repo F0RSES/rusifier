@@ -312,3 +312,111 @@ def test_deb_size_increase_under_5_percent() -> None:
     assert growth < 0.05, (
         f"{debs[0].name}: {size} байт (+{growth:.2%}) — больше лимита 5 %"
     )
+
+
+#: Пять строк с англицизмами — каждая даёт замену с подменой base-14 шрифта.
+MULTI_LINES = [
+    "The feedback from the meeting was clear.",
+    "Our roadmap and deadline are fixed.",
+    "The stakeholder meeting was short.",
+    "Onboarding and milestone are planned.",
+    "The deliverable and feedback are ready.",
+]
+
+
+@pytest.fixture()
+def multi_block_pdf(tmp_path: Path) -> Path:
+    """PDF с пятью блоками Helvetica (пять подмен шрифта)."""
+    path = tmp_path / "five.pdf"
+    pdf = canvas.Canvas(str(path))
+    pdf.setFont("Helvetica", 12)
+    for index, line in enumerate(MULTI_LINES):
+        pdf.drawString(72, 720 - index * 20, line)
+    pdf.save()
+    return path
+
+
+def _run_cli(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
+    """Вызвать ``main`` и вернуть (код, stdout, stderr)."""
+    from src.cli import main
+
+    code = main(argv)
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_stderr_quiet_by_default(
+    multi_block_pdf: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Без --verbose внутренние трейсбеки pdf_edit_engine не попадают в stderr."""
+    code, _, err = _run_cli(
+        ["--input", str(multi_block_pdf), "--output", str(tmp_path / "out.pdf")],
+        capsys,
+    )
+
+    assert code == 0
+    assert "Font extension failed" not in err
+    assert "подавлено" in err
+
+
+def test_warning_emitted_once(
+    multi_block_pdf: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Предупреждение о подавлении — ровно одно на документ."""
+    _, _, err = _run_cli(
+        ["--input", str(multi_block_pdf), "--output", str(tmp_path / "out.pdf")],
+        capsys,
+    )
+
+    lines = [line for line in err.splitlines() if "подавлено" in line]
+    assert len(lines) == 1, lines
+    assert "5 внутренних предупреждений" in lines[0]
+
+
+def test_stderr_shows_traceback_with_verbose(
+    multi_block_pdf: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """С --verbose трейсбеки движка остаются в stderr."""
+    code, _, err = _run_cli(
+        [
+            "--input", str(multi_block_pdf),
+            "--output", str(tmp_path / "out.pdf"),
+            "--verbose",
+        ],
+        capsys,
+    )
+
+    assert code == 0
+    assert "Font extension failed" in err
+
+
+def test_verbose_mode_does_not_suppress(
+    multi_block_pdf: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """В verbose видны все пять трейсбеков (по одному на блок)."""
+    _, _, err = _run_cli(
+        [
+            "--input", str(multi_block_pdf),
+            "--output", str(tmp_path / "out.pdf"),
+            "--verbose",
+        ],
+        capsys,
+    )
+
+    assert err.count("Font extension failed") == len(MULTI_LINES)
+    assert "подавлено" not in err
+
+
+def test_engine_logging_restored_after_run(
+    multi_block_pdf: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """После прогона логгер pdf_edit_engine снова всплывает в root."""
+    import logging
+
+    _run_cli(
+        ["--input", str(multi_block_pdf), "--output", str(tmp_path / "out.pdf")],
+        capsys,
+    )
+
+    assert logging.getLogger("pdf_edit_engine").propagate is True
+    assert logging.getLogger("pdf_edit_engine").handlers == []
