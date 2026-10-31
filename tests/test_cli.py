@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from docx import Document as DocxDocument
+from types import SimpleNamespace
 
 from src.cli import (
     EXIT_INVALID_ARGS,
@@ -20,6 +21,7 @@ from src.cli import (
     default_output_path,
     main,
 )
+from src.deepseek_client import DeepSeekClient
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_DOCX = PROJECT_ROOT / "tests" / "fixtures" / "sample.docx"
@@ -175,6 +177,19 @@ class _FakeLLMClient:
     def __init__(self, keep_markers: bool = True) -> None:
         self.calls: list[str] = []
         self._keep_markers = keep_markers
+        #: Пустой учёт токенов: CLI не должен падать на двойнике клиента.
+        self._requests = 0
+
+    def usage_summary(self) -> dict[str, Any]:
+        """Тот же контракт, что у настоящего клиента, но без запросов."""
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_hit_tokens": 0,
+            "cache_miss_tokens": 0,
+            "cache_hit_ratio": None,
+            "requests": self._requests,
+        }
 
     def replace_text(
         self,
@@ -267,11 +282,12 @@ def test_json_flag_stdout_is_valid_json(tmp_path: Path) -> None:
     summary = payload["summary"]
     assert set(summary) == {
         "total_blocks", "changed_blocks", "dict_replacements",
-        "llm_replacements", "duration_ms",
+        "llm_replacements", "duration_ms", "llm",
     }
     assert summary["total_blocks"] == 6
     assert summary["changed_blocks"] > 0
     assert isinstance(summary["duration_ms"], int)
+    assert summary["llm"] is None, "без --use-llm расход токенов не определяется"
     assert payload["changes"] and payload["warnings"] == []
     assert output.exists()
 
@@ -599,4 +615,140 @@ def test_skip_suspicious_detects_base64(
         if item.get("kind") == "llm_skipped_suspicious"
     ]
     assert any("base64" in reason for group in reasons for reason in group), reasons
+
+
+# --------------------------------------------------------------------------- #
+# Расход токенов LLM в --json (summary.llm)
+# --------------------------------------------------------------------------- #
+def _install_usage_client(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    prompt_tokens: int = 477,
+    completion_tokens: int = 114,
+    cache_hit: int | None = 256,
+    cache_miss: int | None = 221,
+) -> None:
+    """Подменить фабрику клиента настоящим ``DeepSeekClient`` с фейковым API.
+
+    Ответ модели — эхо пользовательского текста (маркеры батча сохраняются),
+    чтобы проверять именно учёт usage, а не содержимое замен.
+    """
+
+    def completions_create(**kwargs: Any) -> Any:
+        content = kwargs["messages"][-1]["content"]
+        usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+        )
+        if cache_hit is not None:
+            usage.prompt_cache_hit_tokens = cache_hit
+        if cache_miss is not None:
+            usage.prompt_cache_miss_tokens = cache_miss
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+            usage=usage,
+        )
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs: Any) -> None:
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=completions_create)
+            )
+
+    def factory(**kwargs: Any) -> Any:
+        kwargs.pop("sanitize", None)
+        return DeepSeekClient(api_key="test-key", client=_FakeOpenAI(), **kwargs)
+
+    monkeypatch.setattr("src.cli.DeepSeekClient", factory)
+
+
+def test_json_includes_llm_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``summary.llm`` содержит токены и округлённый cache-hit ratio."""
+    source = _docx_with(tmp_path / "usage.docx", [CLEAN])
+    _install_usage_client(monkeypatch)
+
+    code, out, _ = _run(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(tmp_path / "out.docx"),
+            "--use-llm",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == EXIT_OK
+    llm = json.loads(out)["summary"]["llm"]
+    assert llm["prompt_tokens"] == 477
+    assert llm["completion_tokens"] == 114
+    assert llm["cache_hit_tokens"] == 256
+    assert llm["cache_miss_tokens"] == 221
+    assert llm["cache_hit_ratio"] == pytest.approx(0.537)
+
+
+def test_json_no_llm_usage_without_use_llm(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Без ``--use-llm`` поле ``summary.llm`` равно ``None``."""
+    source = _docx_with(tmp_path / "plain.docx", [CLEAN])
+
+    code, out, _ = _run(
+        ["--input", str(source), "--output", str(tmp_path / "out.docx"), "--json"],
+        capsys,
+    )
+
+    assert code == EXIT_OK
+    assert json.loads(out)["summary"]["llm"] is None
+
+
+def test_json_llm_null_when_queue_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--use-llm`` без англицизмов: запросов нет, ``summary.llm`` — ``None``."""
+    source = _docx_with(tmp_path / "russian.docx", ["Обычный русский текст без англицизмов."])
+    _install_usage_client(monkeypatch)
+
+    code, out, _ = _run(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(tmp_path / "out.docx"),
+            "--use-llm",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == EXIT_OK
+    assert json.loads(out)["summary"]["llm"] is None
+
+
+def test_usage_ratio_without_cache_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """API без cache-полей: нули и ``ratio=None``, без падения."""
+    source = _docx_with(tmp_path / "usage.docx", [CLEAN])
+    _install_usage_client(monkeypatch, cache_hit=None, cache_miss=None)
+
+    code, out, _ = _run(
+        [
+            "--input",
+            str(source),
+            "--output",
+            str(tmp_path / "out.docx"),
+            "--use-llm",
+            "--json",
+        ],
+        capsys,
+    )
+
+    assert code == EXIT_OK
+    llm = json.loads(out)["summary"]["llm"]
+    assert llm["cache_hit_tokens"] == 0
+    assert llm["cache_miss_tokens"] == 0
+    assert llm["cache_hit_ratio"] is None
 

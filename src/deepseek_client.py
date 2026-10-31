@@ -450,6 +450,16 @@ class DeepSeekClient:
         self._sanitize = bool(sanitize)
         #: Сведения о последней санитизации (для отчёта CLI); ``None`` — правок не было.
         self.last_sanitization: dict[str, Any] | None = None
+        #: Накопленный расход токенов за сессию (см. :meth:`usage_summary`).
+        self._usage_totals: dict[str, int] = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_hit_tokens": 0,
+            "cache_miss_tokens": 0,
+            "requests": 0,
+        }
+        #: ``True``, если хотя бы один ответ содержал cache-поля.
+        self._cache_reported = False
 
         if not self._prompt_path.exists():
             raise DeepSeekConfigError(f"Шаблон промпта не найден: {self._prompt_path}")
@@ -677,7 +687,7 @@ class DeepSeekClient:
         response: Any,
         log_callback: Callable[[str, str], None] | None,
     ) -> None:
-        """Залогировать расход токенов из ``response.usage``.
+        """Учесть и залогировать расход токенов из ``response.usage``.
 
         Args:
             response: Ответ API.
@@ -704,6 +714,8 @@ class DeepSeekClient:
         if prompt_tokens is None and completion_tokens is None and cache_hit is None:
             return
 
+        self._accumulate_usage(prompt_tokens, completion_tokens, cache_hit, cache_miss)
+
         parts = [
             f"prompt_tokens={prompt_tokens}",
             f"completion_tokens={completion_tokens}",
@@ -713,6 +725,78 @@ class DeepSeekClient:
         if cache_miss is not None:
             parts.append(f"cache_miss={cache_miss}")
         self._log(log_callback, "info", "DeepSeek usage: " + ", ".join(parts))
+
+    def _accumulate_usage(
+        self,
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        cache_hit: int | None,
+        cache_miss: int | None,
+    ) -> None:
+        """Добавить показатели одного ответа к сессионным итогам.
+
+        Args:
+            prompt_tokens: Токены промпта или ``None``.
+            completion_tokens: Токены ответа или ``None``.
+            cache_hit: Токены из кэша или ``None`` (поле не вернули).
+            cache_miss: Токены вне кэша или ``None``.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self._usage_totals["requests"] += 1
+        self._usage_totals["prompt_tokens"] += int(prompt_tokens or 0)
+        self._usage_totals["completion_tokens"] += int(completion_tokens or 0)
+        if cache_hit is not None or cache_miss is not None:
+            self._cache_reported = True
+            self._usage_totals["cache_hit_tokens"] += int(cache_hit or 0)
+            self._usage_totals["cache_miss_tokens"] += int(cache_miss or 0)
+
+    def reset_usage(self) -> None:
+        """Сбросить накопленные показатели расхода токенов.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        for key in self._usage_totals:
+            self._usage_totals[key] = 0
+        self._cache_reported = False
+
+    def usage_summary(self) -> dict[str, Any]:
+        """Итог расхода токенов за сессию для ``--json``-квитанции.
+
+        ``cache_hit_ratio`` = ``hit / (hit + miss)`` с точностью до 3 знаков.
+        Если API не возвращал cache-поля (старые прокси, ``deepseek-reasoner``)
+        или запросов не было — ``None``: ноль здесь означал бы «кэш не работал»,
+        хотя на самом деле показатель неизвестен.
+
+        Returns:
+            dict[str, Any]: ``prompt_tokens``, ``completion_tokens``,
+            ``cache_hit_tokens``, ``cache_miss_tokens``, ``cache_hit_ratio``,
+            ``requests``.
+
+        Raises:
+            Ничего не бросает.
+        """
+        totals = dict(self._usage_totals)
+        cache_total = totals["cache_hit_tokens"] + totals["cache_miss_tokens"]
+        ratio: float | None = None
+        if self._cache_reported and cache_total > 0:
+            ratio = round(totals["cache_hit_tokens"] / cache_total, 3)
+        return {
+            "prompt_tokens": totals["prompt_tokens"],
+            "completion_tokens": totals["completion_tokens"],
+            "cache_hit_tokens": totals["cache_hit_tokens"],
+            "cache_miss_tokens": totals["cache_miss_tokens"],
+            "cache_hit_ratio": ratio,
+            "requests": totals["requests"],
+        }
 
     def _validate(self, raw: str, source_text: str) -> str:
         """Проверить сырой ответ и вернуть очищенный текст.

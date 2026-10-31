@@ -440,6 +440,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif llm_client is not None:
         LOGGER.info("Англицизмов не осталось: LLM не вызывается")
 
+    llm_usage = _collect_llm_usage(llm_client)
+    if llm_usage is not None and not json_mode:
+        LOGGER.info(
+            "LLM: prompt=%s, completion=%s, cache_hit=%s, cache_miss=%s (ratio=%s)",
+            llm_usage["prompt_tokens"],
+            llm_usage["completion_tokens"],
+            llm_usage["cache_hit_tokens"],
+            llm_usage["cache_miss_tokens"],
+            "n/a" if llm_usage["cache_hit_ratio"] is None else llm_usage["cache_hit_ratio"],
+        )
+
     changed_blocks = sum(
         1 for block_id, text in texts.items() if originals.get(block_id) != text
     )
@@ -543,6 +554,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "dict_replacements": report["dict_replacements"],
                         "llm_replacements": report["llm_replacements"],
                         "duration_ms": int((time.perf_counter() - started) * 1000),
+                        "llm": llm_usage,
                     },
                     "changes": changes,
                     "warnings": warnings + skip_warnings + pdf_warnings,
@@ -805,6 +817,37 @@ def _split_blocks(response: str, count: int) -> list[str] | None:
         end = matches[index + 1].start() if index + 1 < count else len(response)
         parts.append(response[match.end() : end].strip())
     return parts
+
+
+def _collect_llm_usage(client: DeepSeekClient | None) -> dict | None:
+    """Итог расхода токенов LLM для ``--json``-квитанции.
+
+    Args:
+        client: Клиент LLM или ``None`` (без ``--use-llm``/``--estimate-cost``).
+
+    Returns:
+        dict | None: ``prompt_tokens``/``completion_tokens``/``cache_*`` и
+        ``cache_hit_ratio`` либо ``None``, если запросов к API не было.
+
+    Raises:
+        Ничего не бросает.
+    """
+    if client is None:
+        return None
+    summary_method = getattr(client, "usage_summary", None)
+    if summary_method is None:
+        # Клиент без учёта токенов (тестовый двойник, сторонняя реализация).
+        return None
+    summary = summary_method()
+    if not summary.get("requests"):
+        return None
+    return {
+        "prompt_tokens": summary["prompt_tokens"],
+        "completion_tokens": summary["completion_tokens"],
+        "cache_hit_tokens": summary["cache_hit_tokens"],
+        "cache_miss_tokens": summary["cache_miss_tokens"],
+        "cache_hit_ratio": summary["cache_hit_ratio"],
+    }
 
 
 def _has_latin_words(text: str, glossary: GlossaryManager) -> bool:

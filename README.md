@@ -1,5 +1,7 @@
 # TermRu
 
+**184 tests passing** · **48.7 MiB .deb** · **PDF + DOCX + PPTX** · **Windows / Linux (deb, AUR)**
+
 CLI-приложение для автоматической замены англицизмов в документах **DOCX**,
 **PPTX** и **PDF** на русские аналоги с сохранением исходного форматирования.
 
@@ -228,10 +230,36 @@ python -m src.cli --input report.docx --use-llm --no-sanitize
 ```json
 {"status":"ok","output":"/abs/report_ru.docx","input":"/abs/report.docx",
  "summary":{"total_blocks":6,"changed_blocks":4,"dict_replacements":7,
-            "llm_replacements":0,"duration_ms":142},
+            "llm_replacements":0,"duration_ms":142,"llm":null},
  "changes":[{"block_id":1,"original":"feedback","replacement":"обратная связь",
              "source":"dict","position":4}],
  "warnings":[]}
+```
+
+С `--use-llm` в `summary.llm` появляется расход токенов:
+
+```json
+"llm":{"prompt_tokens":2742,"completion_tokens":114,
+       "cache_hit_tokens":1280,"cache_miss_tokens":1462,
+       "cache_hit_ratio":0.467}
+```
+
+`cache_hit_ratio` округляется до 3 знаков; если API не вернул cache-поля
+(старые прокси, `deepseek-reasoner`) — `null`, а не `0`.
+
+### Примеры
+
+```bash
+# 1. Словарный режим: быстро, без LLM и сети
+termru --input report.docx --output report_ru.docx --json
+
+# 2. LLM + PDF с подменой шрифта + защита от prompt injection
+termru --input report.pdf --output report_ru.pdf \
+       --use-llm --pdf-substitute-fonts=base14 \
+       --skip-suspicious --json
+
+# 3. Dry-run и оценка стоимости запросов
+termru --input doc.docx --use-llm --estimate-cost
 ```
 
 При ошибке: exit=1 и `{"status":"error","error":"...","errors":[...]}`.
@@ -243,19 +271,56 @@ python -m src.cli --input report.docx --use-llm --no-sanitize
 `--quiet` → только WARNING и ERROR. `--json` не подавляется `--quiet` — это
 данные, а не лог.
 
+## Известные ограничения
+
+**PDF**
+
+* В режиме `strict` (по умолчанию) не-base-14 шрифты не поддерживаются: LaTeX (pdfTeX, dvipdfmx) и
+  LibreOffice получают отказ по блоку, файл при этом не портится. Решение —
+  `--pdf-substitute-fonts=base14` (простые `/Type1` и `/TrueType`).
+* Сабсет `Type0` без кириллических глифов (типичный LaTeX) движок пытается расширить сам и терпит
+  неудачу — помогает только `--pdf-substitute-fonts=always`.
+* Подмена всегда **меняет гарнитуру** блока на DejaVu: метрики шире исходных, текст может
+  занимать больше места. Межстрочный интервал фиксируется (`--pdf-line-height`), поэтому строки не
+  наезжают, но блок может выйти за исходный bbox — это видно как `pdf_overflow`.
+* Визуальная проверка итоговой вёрстки на сложных документах остаётся за пользователем: тесты
+  сравнивают bounding box строк, а не пиксели.
+
+**LLM**
+
+* Детектор prompt injection (`--skip-suspicious`) — **эвристика**, а не защита: он снижает риск,
+  но не гарантирует, что модель не увидит опасный текст в других блоках.
+* `deepseek-reasoner` не поддерживается: клиент передаёт `temperature`, который эта модель не
+  принимает.
+
 ## Статус
 
-Реализованы этапы 1–4:
+Журнал работ (этапы 1–20 закрыты, текущая версия — `v0.2.0-mvp`):
 
-| Модуль | Назначение |
-|---|---|
-| `src/document_processor.py` | чтение/запись DOCX, PPTX, PDF с сохранением runs и стилей |
-| `src/glossary_manager.py` | загрузка и валидация глоссария и исключений |
-| `src/replacement_engine.py` | детерминированная словарная замена (LLM-режим — заглушка) |
-| `src/deepseek_client.py` | клиент DeepSeek: retry, валидация ответа, учёт токенов |
-| `src/cli.py` | `argparse`-интерфейс, батчинг блоков, отчёт |
+| № | Этап | Итог |
+|---|---|---|
+| 1 | Парсинг/запись DOCX, PPTX, PDF | `document_processor`, сохранение runs и стилей |
+| 2 | Глоссарий и исключения | `glossary_manager`, `data/*.json` |
+| 3 | Клиент DeepSeek | `deepseek_client`: retry, валидация ответа, учёт токенов |
+| 4 | Движок замены | `replacement_engine`: словарь + LLM-доработка |
+| 5 | CLI | `argparse`, батчинг, отчёт |
+| 6 | Упаковка | unifypy: `.exe`, `.deb`, AUR (`termru-bin`) |
+| 7 | Машиночитаемая квитанция | `--json` одной строкой, `--quiet`, exit-коды 0/1/2 |
+| 8 | Prompt caching | стабильный системный префикс, `cache_hit` со 2-го батча |
+| 9 | Санитизация | ZWSP в маркерах, `[удалено]` для «ignore … instructions» |
+| 10 | PDF: кириллица | свой Type0/Identity-H subset вместо base-14 |
+| 11 | Git-репозиторий | `.gitignore`, тесты `test_git_repo.sh` |
+| 12 | Шрифты в дистрибутиве | DejaVu в `data/fonts`, работает без системных шрифтов |
+| 13 | Tf-ремонт | `страница → {block_id → Tf}`, выбор по позиции, предупреждения |
+| 14 | Real-world harness | 6 генераторов PDF, fitz-bbox проверки, отчёт `docs/pdf-hardening-report.md` |
+| 15 | Тишина в stderr | подавление внутренних трейсбеков `pdf_edit_engine` |
+| 16 | Размер бандла | 70.5 → 48.7 MiB (−30.8 %), `docs/build-size-report.md` |
+| 17 | PDF reflow + подмена шрифта | `--pdf-line-height`, `--pdf-fit`, `--pdf-substitute-fonts` |
+| 18 | Защита от injection | `--skip-suspicious`: подозрительные блоки не идут в LLM |
+| 19 | Cache-метрики в `--json` | `summary.llm` с токенами и `cache_hit_ratio` |
+| 20 | Финализация | тег `v0.2.0-mvp`, README, **production-ready MVP** |
 
-Тесты: `pytest tests/ -q`.
+Тесты: `pytest tests/ -q` (184), `bash tests/test_deb_desktop.sh` (15), `bash tests/test_git_repo.sh` (7).
 
 ## Сборка дистрибутивов
 
