@@ -22,7 +22,38 @@
       "polydoc",
       "pdf_edit_engine",
       "openai"
-    ]
+    ],
+    "exclude_module": [
+      "onnxruntime",
+      "numpy",
+      "pymupdf",
+      "fitz",
+      "pymupdf_layout",
+      "pymupdf4llm",
+      "pypdfium2",
+      "pypdfium2_raw",
+      "pdfplumber",
+      "rapidocr_onnxruntime",
+      "pytesseract",
+      "tkinter",
+      "matplotlib",
+      "IPython",
+      "jupyter",
+      "notebook",
+      "polydoc.formats.readers.plaintext",
+      "polydoc.formats.readers.markdown",
+      "polydoc.formats.readers.html",
+      "polydoc.formats.readers.json_native",
+      "polydoc.formats.readers.delimited",
+      "polydoc.formats.readers.xlsx",
+      "polydoc.formats.writers.plaintext",
+      "polydoc.formats.writers.markdown",
+      "polydoc.formats.writers.html",
+      "polydoc.formats.writers.json_native",
+      "polydoc.formats.writers.delimited",
+      "polydoc.formats.writers.xlsx"
+    ],
+    "strip": true
   },
   "platforms": {
     "windows": {

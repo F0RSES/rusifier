@@ -191,6 +191,13 @@ python -m src.cli --input report.docx --use-llm --no-sanitize
 динамически). Точка входа для сборки — `termru_entry.py`: PyInstaller запускает
 скрипт без пакета, поэтому относительные импорты `src/cli.py` в нём не работают.
 
+Размер `.deb` — **~49 МиБ** (см. `docs/build-size-report.md`). Из сборки исключены
+`numpy`/`onnxruntime`/`pymupdf`-layout, `pypdfium2`/`pdfplumber` и форматы polydoc, которые CLI
+не поддерживает (`txt/markdown/html/json/csv/xlsx`). Если добавляете формат в
+`SUPPORTED_FORMATS`, не забудьте убрать его модуль из `exclude_module` — иначе он попадёт в
+`unavailable` и не откроется; `tests/test_packaged_binary.py` проверяет DOCX/PPTX/PDF из
+собранного бинарника.
+
 ```bash
 # Ubuntu/Debian: .deb (нужны dpkg-deb, dpkg-dev и fakeroot)
 PATH=.venv/bin:$PATH python -m unifypy . --config unifypy.json --format deb
