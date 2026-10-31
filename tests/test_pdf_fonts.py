@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import sys
 from pathlib import Path
 
 import pymupdf
@@ -14,13 +15,17 @@ from reportlab.pdfgen import canvas
 
 from src.document_processor import DocumentProcessor
 from src.pdf_fonts import (
+    DEFAULT_FONT_DIR,
     PdfFontResolver,
     is_base14_font,
     repair_inherited_font,
     text_has_cyrillic,
 )
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEJAVU = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+#: Размер .deb до бандлинга шрифтов (stage 5) — база для проверки +5 %.
+DEB_BASELINE_BYTES = 73_015_004
 SOURCE_LINE = "The feedback from the meeting was clear."
 NEW_LINE = "The обратная связь from the meeting was clear."
 OTHER_LINE = "Second line about deadline and roadmap."
@@ -228,3 +233,82 @@ def test_repair_inherited_font_inserts_tf() -> None:
     assert fixed == 1
     assert patched.count("/F1 12 Tf") == 2
     assert "BT\n/F1 12 Tf\n1 0 0 1 72 700 Tm" in patched
+
+
+def test_bundled_files_exist() -> None:
+    """Шрифты с кириллицей поставляются в git (data/fonts)."""
+    for name in ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf"):
+        path = PROJECT_ROOT / "data" / "fonts" / name
+        assert path.is_file(), f"нет {path}"
+        assert path.stat().st_size > 100_000
+
+
+def test_license_file_present() -> None:
+    """Рядом со шрифтами лежит лицензия Bitstream Vera."""
+    license_path = PROJECT_ROOT / "data" / "fonts" / "LICENSE-DejaVu.txt"
+    assert license_path.is_file()
+    text = license_path.read_text(encoding="utf-8")
+    assert "Bitstream Vera" in text
+    assert "Permission is hereby granted" in text
+
+
+def test_resolver_prefers_bundled_over_system(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """При рабочем bundled-каталоге системные пути не используются."""
+    monkeypatch.setattr(
+        PdfFontResolver,
+        "CANDIDATES",
+        [("regular", ["DejaVuSans.ttf", "/nonexistent/system-font.ttf"])],
+    )
+    resolver = PdfFontResolver()
+    block = TextBlock(
+        text="x", x=0.0, y=0.0, width=10.0, height=10.0,
+        font_name="Helvetica", font_size=12.0, page=0,
+    )
+
+    path = resolver.find_for_block(block)
+
+    assert path is not None
+    assert path.parent == DEFAULT_FONT_DIR
+    assert resolver._source_of(path) == "bundled"
+
+
+def test_resolver_works_on_windows_like_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """На «Windows» без единого системного TTF работает bundled-шрифт."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(
+        PdfFontResolver,
+        "CANDIDATES",
+        [
+            ("regular", ["DejaVuSans.ttf", "C:/Windows/Fonts/arial.ttf"]),
+            ("bold", ["DejaVuSans-Bold.ttf", "C:/Windows/Fonts/arialbd.ttf"]),
+        ],
+    )
+    resolver = PdfFontResolver()
+    block = TextBlock(
+        text="x", x=0.0, y=0.0, width=10.0, height=10.0,
+        font_name="Helvetica-Bold", font_size=12.0, page=0,
+    )
+
+    path = resolver.find_for_block(block)
+
+    assert path is not None, "bundled-шрифт не найден в Windows-окружении"
+    assert path.parent == DEFAULT_FONT_DIR
+    assert path.name == "DejaVuSans-Bold.ttf"
+
+
+def test_deb_size_increase_under_5_percent() -> None:
+    """Собранный .deb вырос не более чем на 5 % относительно baseline."""
+    debs = sorted((PROJECT_ROOT / "dist").glob("termru_*.deb"))
+    if not debs:
+        pytest.skip("нет dist/termru_*.deb — соберите packaging/build-deb.sh")
+
+    size = debs[0].stat().st_size
+    growth = (size - DEB_BASELINE_BYTES) / DEB_BASELINE_BYTES
+
+    assert growth < 0.05, (
+        f"{debs[0].name}: {size} байт (+{growth:.2%}) — больше лимита 5 %"
+    )

@@ -50,9 +50,13 @@ mkdir -p "$STAGE_DIR"
 install -m755 "$BINARY" "$STAGE_DIR/termru"
 install -m644 "$PROJECT_ROOT/packaging/termru.desktop" "$STAGE_DIR/termru.desktop"
 install -m644 "$PROJECT_ROOT/packaging/icon.png" "$STAGE_DIR/icon.png"
+# Шрифты с кириллицей кладём рядом: PKGBUILD ставит их в /usr/share/termru/fonts
+install -d "$STAGE_DIR/fonts"
+install -m644 "$PROJECT_ROOT"/data/fonts/*.ttf "$STAGE_DIR/fonts/"
+install -m644 "$PROJECT_ROOT/data/fonts/LICENSE-DejaVu.txt" "$STAGE_DIR/fonts/"
 
 TARBALL="$OUT_DIR/termru-${VERSION}.tar.gz"
-tar -czf "$TARBALL" -C "$STAGE_DIR" termru termru.desktop icon.png
+tar -czf "$TARBALL" -C "$STAGE_DIR" termru termru.desktop icon.png fonts
 install -m644 "$PROJECT_ROOT/packaging/PKGBUILD" "$OUT_DIR/PKGBUILD"
 rm -rf "$STAGE_DIR"
 

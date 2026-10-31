@@ -15,6 +15,7 @@
     "add_data": [
       "data/glossary.json:data",
       "data/exceptions.json:data",
+      "data/fonts:data/fonts",
       "prompts/system_prompt.txt:prompts"
     ],
     "hidden_import": [

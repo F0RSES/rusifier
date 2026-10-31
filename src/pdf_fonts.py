@@ -31,6 +31,7 @@ import pikepdf
 
 __all__ = [
     "CYRILLIC_RE",
+    "DEFAULT_FONT_DIR",
     "MISSING_FONT_MESSAGE",
     "PdfFontResolver",
     "add_cyrillic_font",
@@ -41,6 +42,11 @@ __all__ = [
 ]
 
 LOGGER = logging.getLogger(__name__)
+
+#: Шрифты, поставляемые вместе с приложением (попадают в бандл через add_data).
+#: В собранном приложении ``__file__`` указывает внутрь ``sys._MEIPASS``, поэтому
+#: путь автоматически ведёт на распакованные ``data/fonts``.
+DEFAULT_FONT_DIR = Path(__file__).resolve().parent.parent / "data" / "fonts"
 
 #: Кириллица в тексте (включая Ё/ё).
 CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
@@ -61,6 +67,10 @@ _BASE14_PREFIXES = ("Helvetica", "Times", "Courier", "Symbol", "ZapfDingbats")
 
 #: Производители PDF часто кладут эти семейства как алиасы base-14.
 _BASE14_ALIASES = ("Arial", "TimesNewRoman", "CourierNew", "HelveticaNeue")
+
+#: Признаки начертания в имени файла/шрифта.
+_BOLD_TOKEN_RE = re.compile(r"bold|black|heavy", re.IGNORECASE)
+_ITALIC_TOKEN_RE = re.compile(r"italic|oblique", re.IGNORECASE)
 
 
 def text_has_cyrillic(text: str) -> bool:
@@ -123,9 +133,9 @@ def _style_from_name(name: str | None) -> str:
     Raises:
         Ничего не бросает.
     """
-    lowered = (name or "").lower()
-    bold = any(token in lowered for token in ("bold", "black", "heavy"))
-    italic = any(token in lowered for token in ("italic", "oblique"))
+    lowered = name or ""
+    bold = bool(_BOLD_TOKEN_RE.search(lowered))
+    italic = bool(_ITALIC_TOKEN_RE.search(lowered))
     if bold and italic:
         return "bold-italic"
     if bold:
@@ -133,6 +143,33 @@ def _style_from_name(name: str | None) -> str:
     if italic:
         return "italic"
     return "regular"
+
+
+def _matches_style(filename: str, style: str) -> bool:
+    """Проверить, соответствует ли имя файла начертанию.
+
+    Нужен для запасного поиска по ``*.ttf`` в bundled-папке: иначе bold-блоку
+    достался бы любой лежащий рядом шрифт (например, regular).
+
+    Args:
+        filename: Имя файла, например ``DejaVuSans-BoldOblique.ttf``.
+        style: ``"regular"``, ``"bold"``, ``"italic"`` или ``"bold-italic"``.
+
+    Returns:
+        bool: ``True``, если начертание в имени совпадает с запрошенным.
+
+    Raises:
+        Ничего не бросает.
+    """
+    bold = bool(_BOLD_TOKEN_RE.search(filename))
+    italic = bool(_ITALIC_TOKEN_RE.search(filename))
+    if style == "bold":
+        return bold and not italic
+    if style == "italic":
+        return italic and not bold
+    if style == "bold-italic":
+        return bold and italic
+    return not bold and not italic
 
 
 class PdfFontResolver:
@@ -148,12 +185,16 @@ class PdfFontResolver:
         log_callback: Необязательный ``callable(level: str, msg: str)``.
     """
 
-    #: Кандидаты по начертаниям: ``(стиль, [пути])``.
+    #: Кандидаты по начертаниям: ``(стиль, [bundled-имя, *системные пути])``.
+    #: Первый элемент — имя файла в :data:`DEFAULT_FONT_DIR` (или в каталоге,
+    #: переданном в ``bundled_dir``); остальные — абсолютные системные пути.
     CANDIDATES: list[tuple[str, list[str]]] = [
         (
             "regular",
             [
+                "DejaVuSans.ttf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                "/usr/share/termru/fonts/DejaVuSans.ttf",
                 "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
                 "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
                 "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
@@ -165,7 +206,9 @@ class PdfFontResolver:
         (
             "bold",
             [
+                "DejaVuSans-Bold.ttf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/termru/fonts/DejaVuSans-Bold.ttf",
                 "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
                 "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
                 "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
@@ -177,7 +220,9 @@ class PdfFontResolver:
         (
             "italic",
             [
+                "DejaVuSans-Oblique.ttf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+                "/usr/share/termru/fonts/DejaVuSans-Oblique.ttf",
                 "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
                 "/usr/share/fonts/truetype/noto/NotoSans-Italic.ttf",
                 "/usr/share/fonts/truetype/freefont/FreeSansOblique.ttf",
@@ -189,7 +234,9 @@ class PdfFontResolver:
         (
             "bold-italic",
             [
+                "DejaVuSans-BoldOblique.ttf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+                "/usr/share/termru/fonts/DejaVuSans-BoldOblique.ttf",
                 "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
                 "/usr/share/fonts/truetype/noto/NotoSans-BoldItalic.ttf",
                 "/usr/share/fonts/truetype/freefont/FreeSansBoldOblique.ttf",
@@ -208,7 +255,10 @@ class PdfFontResolver:
         """Создать резолвер шрифтов.
 
         Args:
-            bundled_dir: Дополнительная папка с TTF (может отсутствовать).
+            bundled_dir: Папка со шрифтами, которая проверяется первой. По
+                умолчанию — :data:`DEFAULT_FONT_DIR` (``data/fonts`` проекта,
+                в собранном приложении — внутри бандла). Чтобы отключить
+                бандл, передайте несуществующий путь.
             log_callback: Необязательный обработчик сообщений.
 
         Returns:
@@ -217,7 +267,9 @@ class PdfFontResolver:
         Raises:
             Ничего не бросает.
         """
-        self._bundled_dir = Path(bundled_dir) if bundled_dir else None
+        self._bundled_dir = (
+            Path(bundled_dir) if bundled_dir is not None else DEFAULT_FONT_DIR
+        )
         self._log_callback = log_callback
         self._support_cache: dict[str, bool] = {}
 
@@ -248,7 +300,10 @@ class PdfFontResolver:
                 f"(шрифт блока: {name!r})",
             )
         else:
-            self._log("debug", f"{style}: выбран шрифт {path}")
+            self._log(
+                "debug",
+                f"{style}: выбран шрифт {path.name} ({self._source_of(path)})",
+            )
         return path
 
 
@@ -344,12 +399,35 @@ class PdfFontResolver:
             if not candidate.is_file():
                 continue
             if self.supports_cyrillic(candidate):
+                self._log("debug", f"{candidate.name} ({self._source_of(candidate)})")
                 return candidate
             self._log("debug", f"{candidate}: кириллица неполная — пропущен")
         return None
 
+    def _source_of(self, path: Path) -> str:
+        """Определить, откуда взят шрифт: из бандла или из системы.
+
+        Args:
+            path: Найденный путь к TTF.
+
+        Returns:
+            str: ``"bundled"`` или ``"system"``.
+
+        Raises:
+            Ничего не бросает.
+        """
+        try:
+            path.resolve().relative_to(self._bundled_dir.resolve())
+        except (ValueError, OSError):
+            return "system"
+        return "bundled"
+
     def _search_order(self, style: str) -> list[Path]:
         """Построить порядок поиска: bundled-папка, затем системные пути.
+
+        Первый элемент списка кандидатов — имя файла в ``bundled_dir``; дальше
+        идут абсолютные системные пути. Это даёт одинаковый результат на всех
+        платформах: если шрифт есть в дистрибутиве, он используется всегда.
 
         Args:
             style: Начертание.
@@ -361,25 +439,39 @@ class PdfFontResolver:
             Ничего не бросает.
         """
         raw = self._candidates_for(style)
+        if raw is None:
+            # Начертание не заявлено в CANDIDATES — намеренно ничего не ищем
+            # (иначе bold-блоку достался бы regular из bundled-папки).
+            return []
+
         ordered: list[Path] = []
 
-        if self._bundled_dir is not None:
-            for entry in raw:
-                ordered.append(self._bundled_dir / Path(entry).name)
-            if self._bundled_dir.is_dir():
-                ordered.extend(sorted(self._bundled_dir.glob("*.ttf")))
+        bundled_name = raw[0] if raw else ""
+        if bundled_name:
+            ordered.append(self._bundled_dir / bundled_name)
+        if self._bundled_dir.is_dir():
+            # Запасной вариант: TTF того же начертания в папке
+            # (--pdf-font-dir с произвольными именами файлов).
+            ordered.extend(
+                sorted(
+                    path
+                    for path in self._bundled_dir.glob("*.ttf")
+                    if _matches_style(path.name, style)
+                )
+            )
 
-        ordered.extend(Path(entry) for entry in raw)
+        ordered.extend(Path(entry) for entry in raw[1:])
         return ordered
 
-    def _candidates_for(self, style: str) -> list[str]:
+    def _candidates_for(self, style: str) -> list[str] | None:
         """Пути-кандидаты для начертания (читается из :attr:`CANDIDATES`).
 
         Args:
             style: Начертание.
 
         Returns:
-            list[str]: список путей (может быть пустым).
+            list[str] | None: список путей или ``None``, если начертание вообще
+            не описано в :attr:`CANDIDATES`.
 
         Raises:
             Ничего не бросает.
@@ -387,7 +479,7 @@ class PdfFontResolver:
         for candidate_style, paths in self.CANDIDATES:
             if candidate_style == style:
                 return list(paths)
-        return []
+        return None
 
     def _log(self, level: str, message: str) -> None:
         """Записать сообщение в ``logging`` и в ``log_callback``.

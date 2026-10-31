@@ -66,16 +66,20 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 
 Блоки, набранные base-14 шрифтами (Helvetica, Times, Courier), не умеют
 кириллицу: такой шрифт — Type1 без встроенного файла, его нельзя расширить.
-TermRu собирает собственный Type0/Identity-H subset из TTF с русским набором
-(DejaVu Sans → Liberation Sans → Noto Sans → системный аналог) и пишет текст
-тем же кеглем в тот же bbox. Нужен хотя бы один такой шрифт в системе
-(`sudo apt install fonts-dejavu`).
+TermRu собирает собственный Type0/Identity-H subset из TTF и пишет текст тем
+же кеглем в тот же bbox.
+
+**Шрифт DejaVu включён в дистрибутив** — `data/fonts/` (Regular, Bold, Oblique,
+BoldOblique и `LICENSE-DejaVu.txt`, лицензия Bitstream Vera). Системный шрифт
+используется, если доступен, иначе — bundled; порядок поиска «bundled →
+системный» даёт одинаковый результат на Linux, Windows и macOS. Устанавливать
+`fonts-dejavu` не требуется.
 
 ```bash
-# своя папка со шрифтами (портативная сборка)
+# своя папка со шрифтами (переопределяет bundled)
 python -m src.cli --input report.pdf --pdf-font-dir ./fonts
 
-# если шрифта нет: fail — ошибка по блоку (по умолчанию),
+# если шрифта нет вообще: fail — ошибка по блоку (по умолчанию),
 # polydoc — пересборка через polydoc (вёрстка теряется)
 python -m src.cli --input report.pdf --pdf-fallback polydoc
 ```

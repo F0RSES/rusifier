@@ -16,4 +16,11 @@ package() {
     "${pkgdir}/usr/share/applications/termru.desktop"
   install -Dm644 "${srcdir}/icon.png" \
     "${pkgdir}/usr/share/icons/hicolor/256x256/apps/termru.png"
+
+  # Шрифты с кириллицей: резолвер ищет их в /usr/share/termru/fonts
+  # (bundled-копия внутри onefile-бинарника остаётся основной).
+  install -d "${pkgdir}/usr/share/termru/fonts"
+  install -m644 "${srcdir}"/fonts/*.ttf "${pkgdir}/usr/share/termru/fonts/"
+  install -m644 "${srcdir}/fonts/LICENSE-DejaVu.txt" \
+    "${pkgdir}/usr/share/termru/fonts/LICENSE-DejaVu.txt"
 }
