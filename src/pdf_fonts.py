@@ -23,7 +23,7 @@ from __future__ import annotations
 import io
 import logging
 import re
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -686,27 +686,93 @@ _BT_BLOCK_RE = re.compile(r"BT(.*?)ET", re.S)
 _HAS_TF_RE = re.compile(r"/\S+\s+[\d.]+\s+Tf")
 _HAS_TEXT_OP_RE = re.compile(r"\bTj\b|\bTJ\b")
 
+#: ``a b c d e f Tm`` — позиция текста блока (e = x, f = y).
+_BT_TM_RE = re.compile(
+    r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+"
+    r"([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+([-+]?\d*\.?\d+)\s+Tm"
+)
 
-def repair_inherited_font(stream: str, fallback_tf: str) -> tuple[str, int]:
+
+def _nearest_tf(
+    position: tuple[float, float] | None,
+    fallback_map: Mapping[tuple[float, float], str],
+    default_tf: str | None,
+) -> str | None:
+    """Выбрать ``Tf`` для блока без шрифта по его позиции.
+
+    Близость важнее направления: ``block.y`` из ``get_text_layout`` — это низ
+    bbox, а ``Tm`` задаёт базовую линию, поэтому координата самого блока
+    систематически на ~0.25 кегля **меньше** ``Tm`` своей же строки. Если
+    предпочитать только «блоки выше», собственный блок всегда проигрывает
+    соседу на строку выше (реальный случай: Times-строка получала Helvetica).
+    Поэтому ранг — сначала ``|dy|``, затем ``|dx|``; «выше» остаётся лишь
+    тай-брейком при равном расстоянии (порядок чтения).
+
+    Args:
+        position: ``(y, x)`` блока из content stream или ``None``.
+        fallback_map: ``{(y, x): "Tf-оператор"}`` — шрифты блоков страницы.
+        default_tf: Шрифт, если позиция неизвестна.
+
+    Returns:
+        str | None: Оператор ``Tf`` либо ``None``, если выбрать не из чего.
+
+    Raises:
+        Ничего не бросает.
+    """
+    if not fallback_map:
+        return default_tf
+    if position is None:
+        return default_tf
+
+    y_pos, x_pos = position
+    best: tuple[tuple[float, float, int], str] | None = None
+    for (block_y, block_x), tf in fallback_map.items():
+        rank = (
+            abs(block_y - y_pos),
+            abs(block_x - x_pos),
+            0 if block_y >= y_pos else 1,
+        )
+        if best is None or rank < best[0]:
+            best = (rank, tf)
+    return best[1] if best is not None else default_tf
+
+
+def repair_inherited_font(
+    stream: str,
+    fallback_map: Mapping[tuple[float, float], str],
+    default_tf: str | None = None,
+) -> tuple[str, int, list[str]]:
     """Вернуть ``Tf`` в ``BT``-блоки, которые его потеряли.
 
     ``replace_block`` переписывает «палитру» и ставит ``Tf`` на свой блок.
     Следующий ``BT`` без ``Tf`` (так делает, например, reportlab) наследует
     текстовое состояние — то есть наш CID-шрифт — и 1-байтовые коды начинают
-    читаться как половины 2-байтовых. Вставка исходного ``Tf`` возвращает
-    документ в прежний вид.
+    читаться как половины 2-байтовых.
+
+    Шрифт подбирается по позиции: для каждого блока без ``Tf`` берётся
+    ближайший предшествующий блок страницы с известным ``Tf`` (карта строится
+    по всем блокам, а не по одному «самому частому» на страницу).
 
     Args:
         stream: Декодированный content stream страницы.
-        fallback_tf: Готовый оператор, например ``"/F1 12 Tf"``.
+        fallback_map: ``{(y, x): "Tf-оператор"}`` — шрифты блоков страницы.
+        default_tf: Оператор для блоков, чью позицию определить не удалось.
 
     Returns:
-        tuple[str, int]: (исправленный поток, сколько блоков починено).
+        tuple[str, int, list[str]]: (исправленный поток, сколько блоков
+        починено, предупреждения о блоках без определимого шрифта).
 
     Raises:
         Ничего не бросает.
     """
+    if not fallback_map:
+        # Ни одного известного блока на странице — выбирать не из чего.
+        # Предупреждать не о чем: ремонт этой страницы не применялся вовсе
+        # (в отличие от блока, чью позицию не удалось разобрать).
+        return stream, 0, []
+
     fixed = 0
+    problems: list[str] = []
 
     def _fix(match: re.Match[str]) -> str:
         """Вставить ``Tf`` в один ``BT``-блок, если его там нет.
@@ -724,10 +790,24 @@ def repair_inherited_font(stream: str, fallback_tf: str) -> tuple[str, int]:
         body = match.group(1)
         if _HAS_TF_RE.search(body) or not _HAS_TEXT_OP_RE.search(body):
             return match.group(0)
-        fixed += 1
-        return "BT\n" + fallback_tf + body + "ET"
 
-    return _BT_BLOCK_RE.sub(_fix, stream), fixed
+        position: tuple[float, float] | None = None
+        tm_match = _BT_TM_RE.search(body)
+        if tm_match:
+            position = (float(tm_match.group(6)), float(tm_match.group(5)))
+
+        tf = _nearest_tf(position, fallback_map, default_tf)
+        if tf is None:
+            problems.append(
+                "BT без Tf: не удалось определить шрифт по позиции "
+                f"({position}) — блок оставлен как есть"
+            )
+            return match.group(0)
+
+        fixed += 1
+        return "BT\n" + tf + body + "ET"
+
+    return _BT_BLOCK_RE.sub(_fix, stream), fixed, problems
 
 
 

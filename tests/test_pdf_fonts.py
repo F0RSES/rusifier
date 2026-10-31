@@ -221,18 +221,59 @@ def test_text_has_cyrillic(text: str, expected: bool) -> None:
 
 
 def test_repair_inherited_font_inserts_tf() -> None:
-    """BT без Tf получает исходный шрифт, BT с Tf не трогается."""
+    """BT без Tf получает шрифт ближайшего предшествующего блока страницы."""
     stream = (
-        "BT\n/TFCyr0 12 Tf\n(a) Tj\nET\n"
+        "BT\n/TFCyr0 12 Tf\n1 0 0 1 72 720 Tm\n(a) Tj\nET\n"
         "BT\n1 0 0 1 72 700 Tm\n(b) Tj\nET\n"
-        "BT\n/F1 12 Tf\n(c) Tj\nET\n"
+        "BT\n/F1 12 Tf\n1 0 0 1 72 680 Tm\n(c) Tj\nET\n"
     )
+    fallback_map = {(720.0, 72.0): "/F1 12 Tf", (680.0, 72.0): "/F1 12 Tf"}
 
-    patched, fixed = repair_inherited_font(stream, "/F1 12 Tf")
+    patched, fixed, problems = repair_inherited_font(stream, fallback_map)
 
     assert fixed == 1
+    assert problems == []
     assert patched.count("/F1 12 Tf") == 2
     assert "BT\n/F1 12 Tf\n1 0 0 1 72 700 Tm" in patched
+
+
+def test_repair_inherited_font_picks_nearest_preceding() -> None:
+    """На странице с двумя гарнитурами каждый BT получает свой шрифт."""
+    stream = (
+        "BT\n/Helv 10 Tf\n1 0 0 1 72 700 Tm\n(helv) Tj\nET\n"
+        "BT\n1 0 0 1 72 680 Tm\n(after helv) Tj\nET\n"
+        "BT\n/Times 10 Tf\n1 0 0 1 72 400 Tm\n(times) Tj\nET\n"
+        "BT\n1 0 0 1 72 380 Tm\n(after times) Tj\nET\n"
+    )
+    fallback_map = {(700.0, 72.0): "/Helv 10 Tf", (400.0, 72.0): "/Times 10 Tf"}
+
+    patched, fixed, problems = repair_inherited_font(stream, fallback_map)
+
+    assert fixed == 2
+    assert problems == []
+    assert "BT\n/Helv 10 Tf\n1 0 0 1 72 680 Tm" in patched
+    assert "BT\n/Times 10 Tf\n1 0 0 1 72 380 Tm" in patched
+
+
+def test_repair_inherited_font_reports_unknown_position() -> None:
+    """BT без Tm и без Tf остаётся как есть, но попадает в предупреждения."""
+    stream = "BT\n(no position) Tj\nET\n"
+
+    patched, fixed, problems = repair_inherited_font(stream, {(700.0, 72.0): "/F1 10 Tf"})
+
+    assert fixed == 0
+    assert patched == stream
+    assert len(problems) == 1
+    assert "не удалось определить шрифт" in problems[0]
+
+
+def test_repair_inherited_font_without_map_is_noop() -> None:
+    """Пустая карта: ни одной вставки и ни одного предупреждения."""
+    stream = "BT\n1 0 0 1 72 700 Tm\n(a) Tj\nET\n"
+
+    patched, fixed, problems = repair_inherited_font(stream, {})
+
+    assert (patched, fixed, problems) == (stream, 0, [])
 
 
 def test_bundled_files_exist() -> None:

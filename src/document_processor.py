@@ -47,8 +47,7 @@ import difflib
 import logging
 import shutil
 import tempfile
-from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
@@ -646,7 +645,13 @@ class DocumentProcessor:
             Непредвиденные сбои логируются и также возвращаются в ``errors``.
         """
         errors: list[dict] = []
-        result: dict = {"success": False, "errors": errors, "replaced_count": 0}
+        warnings: list[str] = []
+        result: dict = {
+            "success": False,
+            "errors": errors,
+            "replaced_count": 0,
+            "warnings": warnings,
+        }
 
         try:
             fmt = self.detect_format(file_path)
@@ -682,7 +687,7 @@ class DocumentProcessor:
                 shutil.copy2(src, dst)
                 self._log("info", f"{src.name}: замен нет, файл скопирован в {dst.name}")
             else:
-                applied, apply_errors = self._apply(fmt, src, normalized, dst)
+                applied, apply_errors = self._apply(fmt, src, normalized, dst, warnings)
                 errors.extend(apply_errors)
                 result["replaced_count"] = applied
                 self._log("info", f"{src.name}: применено замен — {applied}")
@@ -702,6 +707,7 @@ class DocumentProcessor:
         src: Path,
         replacements: dict[int, str],
         dst: Path,
+        warnings: list[str] | None = None,
     ) -> tuple[int, list[dict]]:
         """Применить замены движком, соответствующим формату.
 
@@ -710,6 +716,7 @@ class DocumentProcessor:
             src: Исходный файл.
             replacements: Нормализованные замены ``{block_id: new_text}``.
             dst: Файл результата.
+            warnings: Накопитель предупреждений (для PDF-ремонта ``Tf``).
 
         Returns:
             tuple[int, list[dict]]: (число изменённых блоков, ошибки по блокам).
@@ -718,15 +725,17 @@ class DocumentProcessor:
             Exception: любые ошибки чтения/записи пробрасываются вызывающему
                 :meth:`apply_replacements`, который превращает их в ``errors``.
         """
+        collected: list[str] = warnings if warnings is not None else []
         if fmt == "pdf":
-            return self._apply_pdf(src, replacements, dst)
-        return self._apply_polydoc(src, replacements, dst)
+            return self._apply_pdf(src, replacements, dst, collected)
+        return self._apply_polydoc(src, replacements, dst, collected)
 
     def _apply_polydoc(
         self,
         src: Path,
         replacements: dict[int, str],
         dst: Path,
+        warnings: list[str] | None = None,
     ) -> tuple[int, list[dict]]:
         """Применить замены к DOCX/PPTX через модель polydoc.
 
@@ -734,6 +743,7 @@ class DocumentProcessor:
             src: Исходный ``.docx``/``.pptx``.
             replacements: Нормализованные замены.
             dst: Файл результата.
+            warnings: Накопитель предупреждений (для этих форматов не нужен).
 
         Returns:
             tuple[int, list[dict]]: (число изменённых блоков, ошибки по блокам).
@@ -945,6 +955,7 @@ class DocumentProcessor:
         src: Path,
         replacements: dict[int, str],
         dst: Path,
+        warnings: list[str] | None = None,
     ) -> tuple[int, list[dict]]:
         """Применить замены к PDF, выбрав движок из :data:`PDF_ENGINE_ORDER`.
 
@@ -952,6 +963,7 @@ class DocumentProcessor:
             src: Исходный PDF.
             replacements: Нормализованные замены.
             dst: Файл результата.
+            warnings: Накопитель предупреждений (ремонт ``Tf``).
 
         Returns:
             tuple[int, list[dict]]: (число изменённых блоков, ошибки по блокам).
@@ -962,7 +974,7 @@ class DocumentProcessor:
         units, backend = self._pdf_units(src)
 
         if backend == "pdf_edit_engine":
-            return self._apply_pdf_engine(units, replacements, src, dst)
+            return self._apply_pdf_engine(units, replacements, src, dst, warnings)
 
         # TODO(этап 1, fallback): polydoc перерисовывает PDF (ReportLab) и теряет
         # исходную вёрстку. Здесь остаётся место для более точного fallback-а:
@@ -981,6 +993,7 @@ class DocumentProcessor:
         replacements: dict[int, str],
         src: Path,
         dst: Path,
+        warnings: list[str] | None = None,
     ) -> tuple[int, list[dict]]:
         """Заменить текст PDF по bbox строк, сохраняя шрифт и вёрстку.
 
@@ -993,6 +1006,7 @@ class DocumentProcessor:
             replacements: Нормализованные замены.
             src: Исходный PDF.
             dst: Файл результата.
+            warnings: Накопитель предупреждений (ремонт ``Tf``).
 
         Returns:
             tuple[int, list[dict]]: (число изменённых блоков, ошибки по блокам).
@@ -1010,7 +1024,7 @@ class DocumentProcessor:
         counter = None if self._pdf_engine_noise else _suppress_pdf_engine_noise()
         try:
             applied, errors = self._run_pdf_engine(
-                engine, units, replacements, src, dst
+                engine, units, replacements, src, dst, warnings
             )
         finally:
             if counter is not None:
@@ -1031,6 +1045,7 @@ class DocumentProcessor:
         replacements: dict[int, str],
         src: Path,
         dst: Path,
+        warnings: list[str] | None = None,
     ) -> tuple[int, list[dict]]:
         """Один проход правок PDF через ``pdf_edit_engine``.
 
@@ -1040,6 +1055,7 @@ class DocumentProcessor:
             replacements: Нормализованные замены.
             src: Исходный PDF.
             dst: Файл результата.
+            warnings: Накопитель предупреждений (ремонт ``Tf``).
 
         Returns:
             tuple[int, list[dict]]: (число изменённых блоков, ошибки по блокам).
@@ -1047,10 +1063,20 @@ class DocumentProcessor:
         Raises:
             Exception: ошибки чтения/записи пробрасываются наверх.
         """
+        collected: list[str] = warnings if warnings is not None else []
         by_id = {unit.block_id: unit for unit in units}
         applied = 0
         errors: list[dict] = []
         pending = dict(replacements)
+
+        # Исходные Tf всех блоков по страницам — снимаются с модели ДО правок,
+        # чтобы ремонт мог вернуть каждому BT его собственный шрифт.
+        tf_by_page: dict[int, dict[int, str]] = {}
+        for unit in units:
+            node = unit.node
+            tf_by_page.setdefault(int(node.page), {})[unit.block_id] = (
+                f"/{str(node.font_name).lstrip('/')} {float(node.font_size):g} Tf"
+            )
 
         with tempfile.TemporaryDirectory(prefix="termru-pdf-") as tmp_dir:
             prepared, resources, font_errors, missing = self._prepare_pdf_fonts(
@@ -1110,7 +1136,16 @@ class DocumentProcessor:
                 applied += 1
 
             if resources:
-                self._finish_pdf_with_repair(current, dst, by_id, pending)
+                # Ремонт нужен только на страницах, где реально внедрён CID-шрифт:
+                # текстовое состояние не переносится между страницами.
+                repair_pages = {
+                    int(by_id[block_id].node.page)
+                    for block_id in resources
+                    if block_id in by_id
+                }
+                self._finish_pdf_with_repair(
+                    current, dst, by_id, tf_by_page, repair_pages, collected
+                )
             else:
                 shutil.copy2(current, dst)
 
@@ -1326,7 +1361,9 @@ class DocumentProcessor:
         current: Path,
         dst: Path,
         by_id: Mapping[int, _TextUnit],
-        replacements: dict[int, str],
+        tf_by_page: Mapping[int, Mapping[int, str]],
+        pages: Collection[int],
+        warnings: list[str] | None = None,
     ) -> None:
         """Сохранить результат и вернуть ``Tf`` в ``BT``-блоки без шрифта.
 
@@ -1334,11 +1371,21 @@ class DocumentProcessor:
         CID-шрифтом, а следующий ``BT`` без своего ``Tf`` наследует текстовое
         состояние и читает 1-байтовые коды как половины 2-байтовых.
 
+        Шрифт для каждого потерявшего ``Tf`` блока выбирается по позиции: берётся
+        ближайший блок **этой же страницы** с известным исходным ``Tf`` (при равном
+        расстоянии предпочитается блок выше — порядок чтения). Карта
+        ``страница → {block_id → Tf}`` снята до правок, поэтому подменённый блок
+        возвращает соседям свой исходный шрифт, а не CID-шрифт.
+
         Args:
             current: PDF после всех правок.
             dst: Итоговый файл.
             by_id: Блоки по ``block_id``.
-            replacements: Применённые замены (для выбора исходного шрифта).
+            tf_by_page: ``{страница: {block_id: "Tf-оператор"}}`` — исходные
+                шрифты всех блоков, снятые до первой правки.
+            pages: Страницы, где действительно внедрён CID-шрифт (только на них
+                возможна утечка текстового состояния).
+            warnings: Накопитель предупреждений о блоках без определимого шрифта.
 
         Returns:
             None
@@ -1346,7 +1393,11 @@ class DocumentProcessor:
         Raises:
             DocumentProcessingError: файл не открывается или не сохраняется.
         """
+        collected: list[str] = warnings if warnings is not None else []
         repaired_total = 0
+        problems: list[str] = []
+        fallback_maps = self._tf_maps_by_position(by_id, tf_by_page)
+
         try:
             pdf = pikepdf.open(str(current))
         except Exception as exc:  # noqa: BLE001 - разные типы ошибок pikepdf
@@ -1354,8 +1405,10 @@ class DocumentProcessor:
 
         with pdf:
             for index, page in enumerate(pdf.pages):
-                fallback = self._fallback_tf(by_id, replacements, index)
-                if fallback is None:
+                if index not in pages:
+                    continue
+                page_map = fallback_maps.get(index)
+                if not page_map:
                     continue
                 contents = page.get("/Contents")
                 if contents is None:
@@ -1364,47 +1417,56 @@ class DocumentProcessor:
                     raw = b"".join(stream.read_bytes() for stream in contents)
                 else:
                     raw = contents.read_bytes()
-                patched, count = repair_inherited_font(raw.decode("latin-1"), fallback)
+                patched, count, page_problems = repair_inherited_font(
+                    raw.decode("latin-1"), page_map
+                )
                 if count:
                     page["/Contents"] = pdf.make_stream(patched.encode("latin-1"))
                     repaired_total += count
+                problems.extend(f"страница {index + 1}: {item}" for item in page_problems)
 
             if repaired_total:
                 self._log("debug", f"ремонт Tf: исправлено BT-блоков — {repaired_total}")
+            for problem in problems:
+                self._log("warning", f"ремонт Tf: {problem}")
+                collected.append(f"ремонт Tf: {problem}")
             pdf.save(str(dst))
 
     @staticmethod
-    def _fallback_tf(
+    def _tf_maps_by_position(
         by_id: Mapping[int, _TextUnit],
-        replacements: dict[int, str],
-        page_index: int,
-    ) -> str | None:
-        """Оператор ``Tf`` исходного шрифта страницы (самый частый из заменённых).
+        tf_by_page: Mapping[int, Mapping[int, str]],
+    ) -> dict[int, dict[tuple[float, float], str]]:
+        """Карта «страница → ``{(y, x): исходный Tf}``» для ремонта наследования.
+
+        ``(y, x)`` — левый нижний угол блока в координатах PDF (``e``/``f``
+        оператора ``Tm``). Если два блока страницы делят одну позицию, побеждает
+        меньший ``block_id``: выбор детерминирован, а такие блоки по координатам
+        всё равно неразличимы.
 
         Args:
-            by_id: Блоки по ``block_id``.
-            replacements: Применённые замены.
-            page_index: Номер страницы (0-based).
+            by_id: Блоки по ``block_id`` (позиции берутся из ``unit.node``).
+            tf_by_page: ``{страница: {block_id: "Tf-оператор"}}``.
 
         Returns:
-            str | None: например ``"/F1 12 Tf"`` либо ``None``, если на
-            странице не было замен.
+            dict[int, dict[tuple[float, float], str]]: карта по страницам; пустые
+            страницы в результат не попадают.
 
         Raises:
             Ничего не бросает.
         """
-        counts: Counter[tuple[str, float]] = Counter()
-        for block_id, unit in by_id.items():
-            if block_id not in replacements:
-                continue
-            node = unit.node
-            if int(node.page) != page_index:
-                continue
-            counts[(str(node.font_name).lstrip("/"), float(node.font_size))] += 1
-        if not counts:
-            return None
-        (name, size), _ = counts.most_common(1)[0]
-        return f"/{name} {size:g} Tf"
+        maps: dict[int, dict[tuple[float, float], str]] = {}
+        for page_index, block_tfs in tf_by_page.items():
+            page_map: dict[tuple[float, float], str] = {}
+            for block_id in sorted(block_tfs):
+                unit = by_id.get(block_id)
+                if unit is None:
+                    continue
+                node = unit.node
+                page_map.setdefault((float(node.y), float(node.x)), block_tfs[block_id])
+            if page_map:
+                maps[int(page_index)] = page_map
+        return maps
 
     def _apply_pdf_polydoc(
         self,

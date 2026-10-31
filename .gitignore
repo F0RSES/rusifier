@@ -35,6 +35,9 @@ packaging/arch/
 # итог зафиксирован в docs/pdf-font-research.md)
 scratch/
 
+# PDF-фикстуры real-world harness: генерируются тестом при каждом прогоне
+tests/fixtures/pdf/
+
 # ОС/редакторы
 .DS_Store
 Thumbs.db

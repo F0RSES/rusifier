@@ -263,7 +263,8 @@ def test_apply_replacements_pdf_handles_font_limitation(pdf_file: Path, tmp_path
         str(pdf_file), {0: "Обратная связь из встречи была ясной."}, str(output)
     )
 
-    assert set(result) == {"success", "errors", "replaced_count"}
+    assert set(result) == {"success", "errors", "replaced_count", "warnings"}
+    assert isinstance(result["warnings"], list)
     assert output.exists(), "результат должен быть записан даже при ошибке шрифта"
     if not result["success"]:
         assert result["errors"]
