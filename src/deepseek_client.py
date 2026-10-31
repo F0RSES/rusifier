@@ -97,6 +97,63 @@ _ESCAPED_MARKER_RE = re.compile(
     r"([EGТ])\u200b(?=(?:XCEPTIONS|LOSSARY|екст):)", re.IGNORECASE
 )
 
+#: Маркер промпта в начале строки (сильнее, чем просто упоминание в тексте).
+_MARKER_LINE_RE = re.compile(r"(?m)^[ \t]*(?:EXCEPTIONS:|GLOSSARY:|Текст:)", re.IGNORECASE)
+
+#: Упоминания системного промпта.
+_SYSTEM_PROMPT_RE = re.compile(
+    r"system\s+(?:prompt|message)|instructions\s+above", re.IGNORECASE
+)
+
+#: Ролевые конструкции в начале предложения (``You are a …``).
+_ROLEPLAY_RE = re.compile(
+    r"(?:^|[.!?]\s+)(?:you\s+are\s+a|act\s+as|pretend\s+to\s+be)\b", re.IGNORECASE
+)
+
+#: Длинная base64-подобная последовательность без пробелов.
+_BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{100,}={0,2}")
+
+#: Упоминания учётных данных.
+_CREDENTIAL_RE = re.compile(
+    r"\b(?:api[ _-]?key|deepseek_api_key|password|secret)\b", re.IGNORECASE
+)
+
+
+def _looks_suspicious(text: str) -> tuple[bool, list[str]]:
+    """Есть ли в тексте признаки попытки управлять моделью.
+
+    Используется опциональным режимом ``--skip-suspicious``: такие блоки не
+    отправляются в LLM вовсе (только словарная обработка). Это **не** замена
+    санитизации — независимый, более грубый механизм снижения риска.
+
+    Args:
+        text: Исходный (не санитизированный) текст блока.
+
+    Returns:
+        tuple[bool, list[str]]: (подозрительный ли блок, список причин
+        человеческим языком). Пустой список причин означает «чисто».
+
+    Raises:
+        Ничего не бросает.
+    """
+    if not text:
+        return False, []
+
+    reasons: list[str] = []
+    if _MARKER_LINE_RE.search(text):
+        reasons.append("EXCEPTIONS:/GLOSSARY:/Текст: marker")
+    if _IGNORE_INSTRUCTION_RE.search(text):
+        reasons.append("ignore previous instructions")
+    if _SYSTEM_PROMPT_RE.search(text):
+        reasons.append("system prompt reference")
+    if _ROLEPLAY_RE.search(text):
+        reasons.append("role-play instruction")
+    if _BASE64_BLOB_RE.search(text):
+        reasons.append("base64 > 100 chars")
+    if _CREDENTIAL_RE.search(text):
+        reasons.append("credential reference")
+    return bool(reasons), reasons
+
 
 def _map_outside_code(text: str, transform: Callable[[str], str]) -> str:
     """Применить преобразование ко всем участкам вне ```...``` и ``...``.

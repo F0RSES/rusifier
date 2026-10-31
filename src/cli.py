@@ -36,7 +36,12 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from .deepseek_client import DeepSeekClient, DeepSeekError, estimate_input_tokens
+from .deepseek_client import (
+    DeepSeekClient,
+    DeepSeekError,
+    _looks_suspicious,
+    estimate_input_tokens,
+)
 from .document_processor import (
     DEFAULT_PDF_LINE_HEIGHT,
     DEFAULT_PDF_MIN_FONT_SIZE,
@@ -250,6 +255,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="алиас --pdf-substitute-fonts=strict (несовместим с base14/always)",
     )
+    parser.add_argument(
+        "--skip-suspicious",
+        action="store_true",
+        help=(
+            "не отправлять в LLM блоки с признаками prompt injection "
+            "(только словарная обработка); независимо от санитизации"
+        ),
+    )
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument(
         "--verbose",
@@ -355,6 +368,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     texts: dict[int, str] = {}
     changes: list[dict] = []
     warnings: list[str] = []
+    skip_warnings: list[dict] = []
+    skipped_for_llm: list[int] = []
     llm_queue: list[int] = []
     # Очередь LLM нужна и для оценки стоимости, где клиент не создаётся.
     wants_llm = args.use_llm or args.estimate_cost
@@ -374,6 +389,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             )
         if wants_llm and _has_latin_words(new_text, glossary):
+            if args.skip_suspicious:
+                suspicious, reasons = _looks_suspicious(block["text"])
+                if suspicious:
+                    skipped_for_llm.append(block_id)
+                    entry: dict = {
+                        "kind": "llm_skipped_suspicious",
+                        "block_id": block_id,
+                        "reasons": reasons,
+                    }
+                    if args.no_sanitize:
+                        entry["sanitize_disabled"] = True
+                    skip_warnings.append(entry)
+                    LOGGER.warning(
+                        "Блок %s не отправлен в LLM (подозрительный): %s",
+                        block_id,
+                        ", ".join(reasons),
+                    )
+                    continue
             llm_queue.append(block_id)
 
     estimated: dict[str, int] | None = None
@@ -426,6 +459,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         payload = dict(report)
         if json_mode:
             payload["changes"] = changes
+        if skip_warnings:
+            payload["warnings"] = warnings + skip_warnings
+        if skipped_for_llm:
+            payload["skipped_for_llm"] = skipped_for_llm
         if estimated is not None:
             payload["estimated_input_tokens"] = estimated["estimated_input_tokens"]
         _write_stdout(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
@@ -468,7 +505,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result["errors"],
             json_mode,
             extra={
-                "warnings": warnings + pdf_warnings,
+                "warnings": warnings + skip_warnings + pdf_warnings,
+                "skipped_for_llm": skipped_for_llm,
                 "pdf_overflow_count": pdf_overflow_count,
                 "pdf_preflight": pdf_preflight,
             },
@@ -507,7 +545,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "duration_ms": int((time.perf_counter() - started) * 1000),
                     },
                     "changes": changes,
-                    "warnings": warnings + pdf_warnings,
+                    "warnings": warnings + skip_warnings + pdf_warnings,
+                    "skipped_for_llm": skipped_for_llm,
                     "pdf_overflow_count": pdf_overflow_count,
                     "pdf_preflight": pdf_preflight,
                 },
