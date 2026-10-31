@@ -38,6 +38,8 @@ from pathlib import Path
 
 from .deepseek_client import DeepSeekClient, DeepSeekError, estimate_input_tokens
 from .document_processor import (
+    DEFAULT_PDF_LINE_HEIGHT,
+    DEFAULT_PDF_MIN_FONT_SIZE,
     DocumentProcessingError,
     DocumentProcessor,
     UnsupportedFormatError,
@@ -203,6 +205,35 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="машиночитаемая квитанция в stdout (одна строка JSON)",
     )
+    parser.add_argument(
+        "--pdf-line-height",
+        type=float,
+        default=DEFAULT_PDF_LINE_HEIGHT,
+        metavar="FLOAT",
+        help=(
+            "межстрочный интервал для перенесённых строк, кратно кеглю "
+            f"(по умолчанию {DEFAULT_PDF_LINE_HEIGHT})"
+        ),
+    )
+    parser.add_argument(
+        "--pdf-fit",
+        choices=("none", "shrink"),
+        default="none",
+        help=(
+            "none — не менять кегль (по умолчанию); shrink — уменьшать кегль, "
+            "пока текст не влезет в блок"
+        ),
+    )
+    parser.add_argument(
+        "--pdf-min-font-size",
+        type=float,
+        default=DEFAULT_PDF_MIN_FONT_SIZE,
+        metavar="FLOAT",
+        help=(
+            "нижняя граница кегля для --pdf-fit=shrink; ниже — откат на fit=none "
+            f"(по умолчанию {DEFAULT_PDF_MIN_FONT_SIZE})"
+        ),
+    )
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument(
         "--verbose",
@@ -247,6 +278,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.batch_size is not None and args.batch_size < 1:
         LOGGER.error("--batch-size должен быть >= 1, получено %s", args.batch_size)
         return EXIT_INVALID_ARGS
+    if args.pdf_min_font_size is None or args.pdf_min_font_size <= 0:
+        LOGGER.error(
+            "--pdf-min-font-size должен быть > 0, получено %s", args.pdf_min_font_size
+        )
+        return EXIT_INVALID_ARGS
+    if args.pdf_line_height is None or args.pdf_line_height <= 0:
+        LOGGER.error(
+            "--pdf-line-height должен быть > 0, получено %s", args.pdf_line_height
+        )
+        return EXIT_INVALID_ARGS
 
     try:
         glossary = GlossaryManager(args.glossary, args.exceptions)
@@ -265,6 +306,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         pdf_font_dir=args.pdf_font_dir,
         pdf_fallback=args.pdf_fallback,
         pdf_engine_noise=args.verbose,
+        pdf_line_height=args.pdf_line_height,
+        pdf_fit=args.pdf_fit,
+        pdf_min_font_size=args.pdf_min_font_size,
     )
 
     input_path = Path(args.input).expanduser()
@@ -383,8 +427,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             json_mode,
         )
 
+    pdf_warnings = [item for item in (result.get("warnings") or []) if isinstance(item, dict)]
+    pdf_overflow_count = sum(
+        1 for item in pdf_warnings if item.get("kind") == "pdf_overflow"
+    )
+
     for warning in warnings:
         LOGGER.warning("%s", warning)
+    for item in pdf_warnings:
+        LOGGER.debug("PDF: %s", item.get("message", item))
+    if pdf_overflow_count:
+        LOGGER.info(
+            "PDF: %s блоков с переполнением (детали в --json)", pdf_overflow_count
+        )
     LOGGER.info(
         "Готово: %s | блоков: %s | замен словарём: %s | замен LLM: %s | изменено блоков: %s",
         output_path,
@@ -409,7 +464,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "duration_ms": int((time.perf_counter() - started) * 1000),
                     },
                     "changes": changes,
-                    "warnings": warnings,
+                    "warnings": warnings + pdf_warnings,
+                    "pdf_overflow_count": pdf_overflow_count,
                 },
                 ensure_ascii=False,
             )

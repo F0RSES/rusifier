@@ -45,6 +45,7 @@ from __future__ import annotations
 import dataclasses
 import difflib
 import logging
+import re
 import shutil
 import tempfile
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -147,6 +148,20 @@ class DocumentProcessingError(Exception):
 
 #: Логгер библиотеки pdf_edit_engine (её подмодули — дочерние логгеры).
 _PDF_ENGINE_LOGGER = "pdf_edit_engine"
+
+#: Межстрочный интервал по умолчанию (кратно кеглю) для перенесённых строк.
+#: Без явного ``line_height`` движок сжимает интервал до ``bbox_height / len(lines)``,
+#: когда сдвигать контент ниже некуда (последний блок страницы) — строки наезжают.
+DEFAULT_PDF_LINE_HEIGHT = 1.2
+
+#: Минимальный кегль, до которого допустимо уменьшать текст в режиме ``fit="shrink"``.
+DEFAULT_PDF_MIN_FONT_SIZE = 8.0
+
+#: ``applied=6.00`` из ``Degradation(kind="font_size_reduced", detail=...)``.
+_APPLIED_FONT_SIZE_RE = re.compile(r"applied=([0-9]+(?:\.[0-9]+)?)")
+
+#: ``16.8pt`` из сообщения движка об overflow (число есть не всегда).
+_OVERFLOW_PT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*pt", re.IGNORECASE)
 
 
 class _PdfEngineNoiseCounter(logging.Handler):
@@ -390,6 +405,9 @@ class DocumentProcessor:
         pdf_font_dir: str | Path | None = None,
         pdf_fallback: str = "fail",
         pdf_engine_noise: bool = False,
+        pdf_line_height: float = DEFAULT_PDF_LINE_HEIGHT,
+        pdf_fit: str = "none",
+        pdf_min_font_size: float = DEFAULT_PDF_MIN_FONT_SIZE,
     ) -> None:
         """Создать процессор документов.
 
@@ -403,22 +421,67 @@ class DocumentProcessor:
                 через polydoc (вёрстка теряется).
             pdf_engine_noise: ``True`` — не подавлять внутренние предупреждения
                 ``pdf_edit_engine`` (их трейсбеки полезны с ``--verbose``).
+            pdf_line_height: Межстрочный интервал для перенесённых строк, кратно
+                кеглю блока (``--pdf-line-height``). Должен быть > 0.
+            pdf_fit: ``"none"`` — не менять кегль; ``"shrink"`` — разрешить
+                движку уменьшать кегль, пока текст не влезет в bbox
+                (``--pdf-fit``).
+            pdf_min_font_size: Нижняя граница кегля для ``fit="shrink"``; если
+                движок уменьшил сильнее, правка повторяется без shrink
+                (``--pdf-min-font-size``).
 
         Returns:
             None
 
         Raises:
-            ValueError: неизвестное значение ``pdf_fallback``.
+            ValueError: неизвестное значение ``pdf_fallback``/``pdf_fit`` либо
+                неположительный ``pdf_line_height``/``pdf_min_font_size``.
         """
         if pdf_fallback not in ("fail", "polydoc"):
             raise ValueError(
                 f"pdf_fallback должен быть 'fail' или 'polydoc', получено {pdf_fallback!r}"
             )
+        if pdf_fit not in ("none", "shrink"):
+            raise ValueError(f"pdf_fit должен быть 'none' или 'shrink', получено {pdf_fit!r}")
+        if not pdf_line_height or float(pdf_line_height) <= 0:
+            raise ValueError(
+                f"pdf_line_height должен быть > 0, получено {pdf_line_height!r}"
+            )
+        if not pdf_min_font_size or float(pdf_min_font_size) <= 0:
+            raise ValueError(
+                f"pdf_min_font_size должен быть > 0, получено {pdf_min_font_size!r}"
+            )
         self._log_callback = log_callback
         self._pdf_font_dir = Path(pdf_font_dir) if pdf_font_dir else None
         self._pdf_fallback = pdf_fallback
         self._pdf_engine_noise = bool(pdf_engine_noise)
+        self._pdf_line_height = float(pdf_line_height)
+        self._pdf_fit = pdf_fit
+        self._pdf_min_font_size = float(pdf_min_font_size)
+        self._pdf_warnings: list[dict] = []
         self._font_resolver: PdfFontResolver | None = None
+
+    @property
+    def warnings(self) -> list[dict]:
+        """Структурированные предупреждения последнего :meth:`apply_replacements`.
+
+        Записи словарные, чтобы вызывающий код (CLI, CI) мог фильтровать их по
+        ``kind``, не разбирая текст. Виды:
+
+        * ``pdf_overflow`` — текст блока вышел за bbox после переноса;
+        * ``pdf_font_too_small`` — ``fit="shrink"`` уменьшил кегль ниже
+          ``pdf_min_font_size``, правка откачена;
+        * ``pdf_tf_repair`` — блок без ``Tf`` не удалось однозначно сопоставить
+          с исходным шрифтом (ремонт наследования).
+
+        Returns:
+            list[dict]: копия накопленных предупреждений (пустой список, если
+            предупреждений не было).
+
+        Raises:
+            Ничего не бросает.
+        """
+        return list(self._pdf_warnings)
 
     @property
     def font_resolver(self) -> PdfFontResolver:
@@ -645,7 +708,10 @@ class DocumentProcessor:
             Непредвиденные сбои логируются и также возвращаются в ``errors``.
         """
         errors: list[dict] = []
-        warnings: list[str] = []
+        # Предупреждения копятся в процессоре: PDF-правки добавляют записи
+        # структурированно (kind/block_id/…), вызывающий код фильтрует их по kind.
+        self._pdf_warnings = []
+        warnings: list[dict] = self._pdf_warnings
         result: dict = {
             "success": False,
             "errors": errors,
@@ -707,7 +773,7 @@ class DocumentProcessor:
         src: Path,
         replacements: dict[int, str],
         dst: Path,
-        warnings: list[str] | None = None,
+        warnings: list[dict] | None = None,
     ) -> tuple[int, list[dict]]:
         """Применить замены движком, соответствующим формату.
 
@@ -735,7 +801,7 @@ class DocumentProcessor:
         src: Path,
         replacements: dict[int, str],
         dst: Path,
-        warnings: list[str] | None = None,
+        warnings: list[dict] | None = None,
     ) -> tuple[int, list[dict]]:
         """Применить замены к DOCX/PPTX через модель polydoc.
 
@@ -955,7 +1021,7 @@ class DocumentProcessor:
         src: Path,
         replacements: dict[int, str],
         dst: Path,
-        warnings: list[str] | None = None,
+        warnings: list[dict] | None = None,
     ) -> tuple[int, list[dict]]:
         """Применить замены к PDF, выбрав движок из :data:`PDF_ENGINE_ORDER`.
 
@@ -993,7 +1059,7 @@ class DocumentProcessor:
         replacements: dict[int, str],
         src: Path,
         dst: Path,
-        warnings: list[str] | None = None,
+        warnings: list[dict] | None = None,
     ) -> tuple[int, list[dict]]:
         """Заменить текст PDF по bbox строк, сохраняя шрифт и вёрстку.
 
@@ -1045,7 +1111,7 @@ class DocumentProcessor:
         replacements: dict[int, str],
         src: Path,
         dst: Path,
-        warnings: list[str] | None = None,
+        warnings: list[dict] | None = None,
     ) -> tuple[int, list[dict]]:
         """Один проход правок PDF через ``pdf_edit_engine``.
 
@@ -1308,6 +1374,100 @@ class DocumentProcessor:
         Raises:
             Ничего не бросает: исключения движка логируются и попадают в ``errors``.
         """
+        line_height = self._block_line_height(block)
+        fit = self._pdf_fit
+
+        edit = self._call_replace_block(
+            engine,
+            current,
+            block,
+            bbox,
+            new_text,
+            target,
+            block_id,
+            errors,
+            font_name=font_name,
+            line_height=line_height,
+            fit=fit,
+        )
+        if edit is None:
+            return None
+
+        if fit == "shrink":
+            applied = self._applied_font_size(edit, block)
+            if applied is not None and applied < self._pdf_min_font_size:
+                self._log(
+                    "warning",
+                    f"Блок {block_id}: fit=shrink дал кегль {applied:g} pt "
+                    f"< {self._pdf_min_font_size:g} pt — правка повторена без shrink",
+                )
+                self._pdf_warnings.append(
+                    {
+                        "kind": "pdf_font_too_small",
+                        "block_id": block_id,
+                        "requested_min": self._pdf_min_font_size,
+                        "actual": applied,
+                        "message": (
+                            f"Кегль уменьшен до {applied:g} pt, минимум "
+                            f"{self._pdf_min_font_size:g} pt — применён fit=none"
+                        ),
+                    }
+                )
+                edit = self._call_replace_block(
+                    engine,
+                    current,
+                    block,
+                    bbox,
+                    new_text,
+                    target,
+                    block_id,
+                    errors,
+                    font_name=font_name,
+                    line_height=line_height,
+                    fit="none",
+                )
+                if edit is None:
+                    return None
+
+        self._collect_overflow(edit, block_id)
+        return edit
+
+    def _call_replace_block(
+        self,
+        engine: Any,
+        current: Path,
+        block: Any,
+        bbox: tuple[float, float, float, float],
+        new_text: str,
+        target: Path,
+        block_id: int,
+        errors: list[dict],
+        *,
+        font_name: str | None,
+        line_height: float | None,
+        fit: str,
+    ) -> Any | None:
+        """Вызвать ``replace_block`` с нашими параметрами и разобрать результат.
+
+        Args:
+            engine: Модуль ``pdf_edit_engine``.
+            current: PDF, к которому применяется правка.
+            block: ``TextBlock`` блока.
+            bbox: Координаты ``(x0, y0, x1, y1)``.
+            new_text: Новый текст блока.
+            target: Путь для результата шага.
+            block_id: Идентификатор блока (для сообщения об ошибке).
+            errors: Список ошибок, который дополняется при неудаче.
+            font_name: Ресурс внедрённого CID-шрифта или ``None``.
+            line_height: Межстрочный интервал в пунктах или ``None``.
+            fit: ``"none"`` или ``"shrink"``.
+
+        Returns:
+            Any | None: ``EditResult`` при успехе, иначе ``None``.
+
+        Raises:
+            Ничего не бросает: исключения движка логируются и попадают в ``errors``.
+        """
         try:
             edit = engine.replace_block(
                 str(current),
@@ -1316,6 +1476,8 @@ class DocumentProcessor:
                 new_text,
                 str(target),
                 font_name=font_name,
+                line_height=line_height,
+                fit=fit,
             )
         except Exception as exc:  # noqa: BLE001 - один блок не ломает остальные
             message = f"Не удалось заменить текст блока {block_id}: {exc}"
@@ -1333,6 +1495,105 @@ class DocumentProcessor:
             return None
 
         return edit
+
+    def _block_line_height(self, block: Any) -> float | None:
+        """Межстрочный интервал для перенесённых строк блока.
+
+        Приоритет: ``font_size * pdf_line_height``; если кегль недоступен или
+        равен нулю — высота блока; если и она нулевая — ``None`` (поведение
+        движка по умолчанию).
+
+        Args:
+            block: ``TextBlock`` с ``font_size``/``height``.
+
+        Returns:
+            float | None: интервал в пунктах либо ``None``.
+
+        Raises:
+            Ничего не бросает.
+        """
+        font_size = float(getattr(block, "font_size", 0) or 0)
+        if font_size > 0:
+            return round(font_size * self._pdf_line_height, 2)
+        height = float(getattr(block, "height", 0) or 0)
+        if height > 0:
+            return round(height, 2)
+        return None
+
+    @staticmethod
+    def _applied_font_size(edit: Any, block: Any) -> float | None:
+        """Фактический кегль после ``fit="shrink"``.
+
+        Движок сообщает об уменьшении через ``Degradation(kind="font_size_reduced",
+        detail="original=12.00,applied=6.00,floor=6.00,fit=False")``. Если такой
+        записи нет, кегль не менялся — возвращается исходный.
+
+        Args:
+            edit: ``EditResult`` успешной правки.
+            block: ``TextBlock`` с исходным ``font_size``.
+
+        Returns:
+            float | None: кегль в пунктах; ``None``, если определить не удалось.
+
+        Raises:
+            Ничего не бросает.
+        """
+        report = getattr(edit, "fidelity_report", None)
+        degradations = getattr(report, "degradations", None) or []
+        for item in degradations:
+            if getattr(item, "kind", "") != "font_size_reduced":
+                continue
+            match = _APPLIED_FONT_SIZE_RE.search(str(getattr(item, "detail", "")))
+            if match:
+                return float(match.group(1))
+        font_size = float(getattr(block, "font_size", 0) or 0)
+        return font_size if font_size > 0 else None
+
+    def _collect_overflow(self, edit: Any, block_id: int) -> None:
+        """Записать предупреждение, если текст вышел за bbox блока.
+
+        Overflow не подавляется: это actionable-информация (блок «вылез» за
+        исходные границы после переноса), она уходит в ``result["warnings"]``
+        структурированной записью.
+
+        Args:
+            edit: ``EditResult`` успешной правки.
+            block_id: Идентификатор блока.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        messages = [
+            str(item)
+            for item in (getattr(edit, "warnings", None) or [])
+            if "overflow" in str(item).lower()
+        ]
+        report = getattr(edit, "fidelity_report", None)
+        overflow_flag = bool(getattr(report, "overflow_detected", False))
+        if not messages and not overflow_flag:
+            return
+
+        overflow_pt = 0.0
+        message = "Overflow detected (размер не сообщён движком)"
+        for item in messages:
+            match = _OVERFLOW_PT_RE.search(item)
+            if match:
+                overflow_pt = float(match.group(1))
+                message = item
+                break
+
+        self._log("debug", f"Блок {block_id}: overflow — {message}")
+        self._pdf_warnings.append(
+            {
+                "kind": "pdf_overflow",
+                "block_id": block_id,
+                "overflow_pt": overflow_pt,
+                "message": message,
+            }
+        )
 
     @staticmethod
     def _describe_pdf_edit(edit: Any) -> str:
@@ -1363,7 +1624,7 @@ class DocumentProcessor:
         by_id: Mapping[int, _TextUnit],
         tf_by_page: Mapping[int, Mapping[int, str]],
         pages: Collection[int],
-        warnings: list[str] | None = None,
+        warnings: list[dict] | None = None,
     ) -> None:
         """Сохранить результат и вернуть ``Tf`` в ``BT``-блоки без шрифта.
 
@@ -1429,7 +1690,13 @@ class DocumentProcessor:
                 self._log("debug", f"ремонт Tf: исправлено BT-блоков — {repaired_total}")
             for problem in problems:
                 self._log("warning", f"ремонт Tf: {problem}")
-                collected.append(f"ремонт Tf: {problem}")
+                collected.append(
+                    {
+                        "kind": "pdf_tf_repair",
+                        "page": index + 1,
+                        "message": f"ремонт Tf: {problem}",
+                    }
+                )
             pdf.save(str(dst))
 
     @staticmethod

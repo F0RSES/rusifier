@@ -128,3 +128,54 @@ y0=148.15 y1=162.12 | 'дорожная карта.'
   `result["warnings"]`, чтобы пользователь знал, что блок «вылез» за bbox;
 * нужно ли уменьшать кегль (`fit="shrink"`), когда текст всё равно не влезает в ширину — это
   отдельное поведение (`font_size_reduced`), по умолчанию не включаем.
+
+## 7. Реализация (этап 2)
+
+Решения по открытым вопросам: overflow **поднимается** в `result["warnings"]` структурной записью
+(без порога, одна INFO-строка в stderr на документ); `fit="shrink"` — только opt-in.
+
+### 7.1 Изменения
+
+| Место | Что сделано |
+|---|---|
+| `DocumentProcessor._block_line_height` | `font_size * pdf_line_height` (по умолчанию 1.2) → `block.height` → `None` |
+| `DocumentProcessor._call_replace_block` | единая обёртка над `replace_block(..., line_height=…, fit=…)` |
+| `DocumentProcessor._collect_overflow` | `fidelity_report.overflow_detected` / `warnings` → `{"kind": "pdf_overflow", "block_id", "overflow_pt", "message"}` |
+| `DocumentProcessor._applied_font_size` | кегль из `Degradation(kind="font_size_reduced", detail="applied=…")` |
+| откат shrink | если `applied < pdf_min_font_size` → повтор с `fit="none"` + `{"kind": "pdf_font_too_small", "requested_min", "actual"}` |
+| `DocumentProcessor.warnings` | свойство: `list[dict]` последнего прогона (это же в `result["warnings"]`) |
+| CLI | `--pdf-line-height` (1.2), `--pdf-fit {none,shrink}`, `--pdf-min-font-size` (8.0); `<= 0` → exit 2 |
+| CLI `--json` | `pdf_overflow_count` + структурные warnings в общем списке |
+
+**`fit="shrink"` поддерживается движком нативно** (`structural.py:1810`,
+`fit: Literal["none", "shrink"]`). Свой цикл уменьшения кегля не писали: движок сам бинарным
+поиском подбирает кегль с floor `max(4.0, original * 0.5)`; наш код проверяет фактический кегль и
+откатывает правку, если он ниже пользовательского минимума.
+
+### 7.2 Проверка `report_ru.pdf`
+
+| Метрика | До | После |
+|---|---|---|
+| Максимальное перекрытие строк (fitz) | **+7.97 pt** | **−0.43 pt** |
+| Полосы рендера (140 dpi, x 50–400) | `(50,72) (78,96) **(121,155)**` — две строки слиты | `(50,72) (78,96) (121,143) (154,171)` |
+| Зазоры между полосами, px | 5, — | 5, 24, **10** |
+| `Td` перенесённой строки | `0 -6 Td` | `0 -14.4 Td` |
+| `pdf_overflow_count` | — (поля не было) | 2 |
+
+### 7.3 Тесты
+
+`tests/test_pdf_reflow.py`, 14 тестов (проверяют bbox через fitz, а не `get_text`):
+`test_pdf_lines_do_not_overlap` (reportlab / PyMuPDF / две колонки), `test_reflow_leading_applied`,
+`test_no_overlap_on_real_pdfs`, `test_repair_inherited_font_does_not_shift_tm`,
+`test_pdf_fit_shrink_respects_min_font_size`, `test_pdf_fit_shrink_success`,
+`test_pdf_line_height_override`, `test_default_line_height_is_1_2`,
+`test_overflow_warning_in_json`, `test_overflow_count_in_json`,
+`test_pdf_min_font_size_must_be_positive`, `test_pdf_line_height_flag_reaches_processor`.
+
+Две особенности проверки, найденные на реальных документах:
+
+1. сравнивать строки нужно только при пересечении **по x** — иначе две колонки на одной базовой
+   линии дают ложное «наложение»;
+2. в реальных PDF уже есть исходные перекрытия bbox (заголовок 60 pt и подзаголовок), поэтому
+   проверяются пары вокруг **заменённых** строк, а не все строки документа.
+
