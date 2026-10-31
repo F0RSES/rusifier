@@ -1,0 +1,6 @@
+polydoc[all]
+pdf-edit-engine
+openai
+python-dotenv
+unifypy
+pytest

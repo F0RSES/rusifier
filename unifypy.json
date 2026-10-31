@@ -1,0 +1,37 @@
+{
+  "$schema": "https://unifypy.dev/schemas/build.schema.json",
+  "name": "termru",
+  "display_name": "TermRu",
+  "version": "0.1.0",
+  "entry": "termru_entry.py",
+  "publisher": "TermRu contributors",
+  "description": "Замена англицизмов в документах DOCX/PPTX/PDF",
+  "icon": "packaging/icon.png",
+  "license": "LICENSE",
+  "onefile": false,
+  "console": true,
+  "pyinstaller": {
+    "additional_hooks_dir": ["packaging/hooks"],
+    "add_data": [
+      "data/glossary.json:data",
+      "data/exceptions.json:data",
+      "prompts/system_prompt.txt:prompts"
+    ],
+    "hidden_import": [
+      "polydoc",
+      "pdf_edit_engine",
+      "openai"
+    ]
+  },
+  "platforms": {
+    "windows": {
+      "formats": ["exe"]
+    },
+    "linux": {
+      "formats": ["deb"],
+      "deb": {
+        "create_desktop_file": false
+      }
+    }
+  }
+}

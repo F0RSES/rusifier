@@ -1,0 +1,438 @@
+"""Тесты CLI TermRu: коды возврата, dry-run, путь по умолчанию, отчёт."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+from docx import Document as DocxDocument
+
+from src.cli import (
+    EXIT_INVALID_ARGS,
+    EXIT_OK,
+    EXIT_PROCESSING_ERROR,
+    _join_blocks,
+    _split_blocks,
+    default_output_path,
+    main,
+)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SAMPLE_DOCX = PROJECT_ROOT / "tests" / "fixtures" / "sample.docx"
+
+
+@pytest.fixture()
+def docx_copy(tmp_path: Path) -> Path:
+    """Копия фикстуры: тесты не должны писать рядом с репозиторием."""
+    target = tmp_path / "sample.docx"
+    target.write_bytes(SAMPLE_DOCX.read_bytes())
+    return target
+
+
+def _run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
+    """Вызвать ``main`` и вернуть (код, stdout, stderr)."""
+    code = main(argv)
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_dry_run_does_not_create_output(
+    docx_copy: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--dry-run печатает JSON и не создаёт файл (даже при явном --output)."""
+    explicit_output = tmp_path / "explicit.docx"
+
+    code, out, _ = _run(
+        ["--input", str(docx_copy), "--dry-run", "--output", str(explicit_output)],
+        capsys,
+    )
+
+    assert code == EXIT_OK
+    assert not default_output_path(docx_copy).exists()
+    assert not explicit_output.exists()
+
+    report = json.loads(out)
+    assert set(report) == {
+        "total_blocks",
+        "dict_replacements",
+        "llm_replacements",
+        "changes",
+        "warnings",
+    }
+    assert report["total_blocks"] > 0
+    assert report["dict_replacements"] > 0
+    assert report["llm_replacements"] == 0
+
+
+def test_missing_input_returns_exit_code_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Отсутствующий входной файл — ошибка обработки, не аргументов."""
+    code, out, err = _run(
+        ["--input", str(tmp_path / "absent.docx"), "--dry-run"], capsys
+    )
+
+    assert code == EXIT_PROCESSING_ERROR
+    assert out == "", "в stdout не должно быть отчёта при ошибке"
+    assert "не найден" in err.lower()
+
+
+def test_default_output_path_appends_ru_suffix(
+    docx_copy: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Без --output результат пишется в <input>_ru.<ext>."""
+    assert default_output_path(Path("report.docx")) == Path("report_ru.docx")
+    assert default_output_path(docx_copy) == docx_copy.with_name("sample_ru.docx")
+
+    code, out, _ = _run(["--input", str(docx_copy)], capsys)
+
+    assert code == EXIT_OK
+    assert out == ""
+    assert docx_copy.with_name("sample_ru.docx").exists()
+
+
+def test_changes_have_expected_structure(
+    docx_copy: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Каждый change содержит block_id/original/replacement/source."""
+    _, out, _ = _run(["--input", str(docx_copy), "--dry-run"], capsys)
+
+    changes = json.loads(out)["changes"]
+    assert changes, "ожидались словарные замены"
+    for change in changes:
+        assert set(change) == {"block_id", "original", "replacement", "source"}
+        assert change["source"] == "dict"
+        assert change["replacement"] != change["original"]
+
+
+def test_invalid_batch_size_returns_exit_code_2(
+    docx_copy: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Неположительный --batch-size — невалидные аргументы."""
+    code, out, err = _run(
+        ["--input", str(docx_copy), "--dry-run", "--batch-size", "0"], capsys
+    )
+
+    assert code == EXIT_INVALID_ARGS
+    assert out == ""
+    assert "batch-size" in err
+
+
+def test_unknown_flag_returns_exit_code_2(
+    docx_copy: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Неизвестный флаг разбирает argparse и отдаёт код 2."""
+    code, _, err = _run(["--input", str(docx_copy), "--bogus"], capsys)
+
+    assert code == EXIT_INVALID_ARGS
+    assert "bogus" in err
+
+
+def test_use_llm_without_api_key_returns_exit_code_1(
+    docx_copy: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--use-llm без ключа — ошибка обработки с внятным сообщением."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
+
+    code, out, err = _run(["--input", str(docx_copy), "--dry-run", "--use-llm"], capsys)
+
+    assert code == EXIT_PROCESSING_ERROR
+    assert out == ""
+    assert "DEEPSEEK_API_KEY" in err
+
+
+def test_written_document_contains_russian_text(
+    docx_copy: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Записанный файл содержит замены и сохраняет форматирование."""
+    code, _, _ = _run(["--input", str(docx_copy)], capsys)
+
+    assert code == EXIT_OK
+    output = default_output_path(docx_copy)
+    document = DocxDocument(str(output))
+    joined = "\n".join(paragraph.text for paragraph in document.paragraphs)
+
+    assert "обратная связь" in joined
+    assert "feedback" not in joined
+    assert "KPI" in joined, "исключения не должны меняться"
+
+    bold_runs = [
+        run.text
+        for paragraph in document.paragraphs
+        for run in paragraph.runs
+        if run.bold
+    ]
+    assert any("дорожная карта" in text for text in bold_runs), bold_runs
+
+
+class _FakeLLMClient:
+    """Заглушка ``DeepSeekClient`` для проверки батчинга без сети."""
+
+    def __init__(self, keep_markers: bool = True) -> None:
+        self.calls: list[str] = []
+        self._keep_markers = keep_markers
+
+    def replace_text(
+        self,
+        text: str,
+        glossary: dict[str, str],
+        exceptions: dict[str, None],
+        log_callback: object | None = None,
+        block_id: object | None = None,
+    ) -> str:
+        self.calls.append(text)
+        cleaned = text.replace("Quarterly", "Ежеквартальный").replace("ready", "готово")
+        if self._keep_markers:
+            return cleaned
+        return cleaned.replace("<<<", "").replace(">>>", "")
+
+
+def test_join_and_split_blocks_roundtrip() -> None:
+    """Склеивание и разбор батча по маркерам обратимы."""
+    texts = ["Первый блок", "Второй блок"]
+
+    joined = _join_blocks(texts)
+
+    assert "<<<TERMRU:0>>>" in joined and "<<<TERMRU:1>>>" in joined
+    assert _split_blocks(joined, len(texts)) == texts
+
+
+def test_split_blocks_rejects_broken_markup() -> None:
+    """Неверное число маркеров или их порядок — сигнал о сбое разметки."""
+    assert _split_blocks("<<<TERMRU:0>>>\nа", 2) is None
+    assert _split_blocks("<<<TERMRU:1>>>\na\n<<<TERMRU:0>>>\nb", 2) is None
+
+
+def test_use_llm_records_llm_changes(
+    docx_copy: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """С --use-llm батчи уходят в LLM, а правки попадают в отчёт."""
+    fake = _FakeLLMClient()
+    monkeypatch.setattr("src.cli.DeepSeekClient", lambda **_: fake)
+
+    code, out, _ = _run(
+        ["--input", str(docx_copy), "--dry-run", "--use-llm", "--batch-size", "2"],
+        capsys,
+    )
+
+    report = json.loads(out)
+    assert code == EXIT_OK
+    assert report["llm_replacements"] > 0
+    assert any(change["source"] == "llm" for change in report["changes"])
+    assert any("<<<TERMRU:0>>>" in call for call in fake.calls), "батч должен идти с маркерами"
+
+
+def test_llm_broken_markup_falls_back_to_single_blocks(
+    docx_copy: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Если модель сломала маркеры, блоки обрабатываются поштучно."""
+    fake = _FakeLLMClient(keep_markers=False)
+    monkeypatch.setattr("src.cli.DeepSeekClient", lambda **_: fake)
+
+    code, out, _ = _run(["--input", str(docx_copy), "--dry-run", "--use-llm"], capsys)
+
+    report = json.loads(out)
+    assert code == EXIT_OK
+    assert any("разметка" in warning for warning in report["warnings"])
+    assert report["llm_replacements"] > 0
+
+
+def test_json_flag_stdout_is_valid_json(tmp_path: Path) -> None:
+    """--json: одна строка JSON с квитанцией в stdout."""
+    output = tmp_path / "out.docx"
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "src.cli",
+            "--input", str(SAMPLE_DOCX),
+            "--output", str(output),
+            "--json",
+        ],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == EXIT_OK, completed.stderr
+    assert completed.stdout.count("\n") == 1, "ожидался JSON одной строкой"
+
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "ok"
+    assert payload["input"] == str(SAMPLE_DOCX.resolve())
+    assert payload["output"] == str(output.resolve())
+    summary = payload["summary"]
+    assert set(summary) == {
+        "total_blocks", "changed_blocks", "dict_replacements",
+        "llm_replacements", "duration_ms",
+    }
+    assert summary["total_blocks"] == 6
+    assert summary["changed_blocks"] > 0
+    assert isinstance(summary["duration_ms"], int)
+    assert payload["changes"] and payload["warnings"] == []
+    assert output.exists()
+
+
+def test_json_error_stdout_is_valid_json(tmp_path: Path) -> None:
+    """Ошибка: exit=1 и валидный JSON со status=error."""
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "src.cli",
+            "--input", str(tmp_path / "absent.docx"),
+            "--json",
+        ],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == EXIT_PROCESSING_ERROR
+    payload = json.loads(completed.stdout)
+    assert payload["status"] == "error"
+    assert "не найден" in payload["error"].lower()
+    assert isinstance(payload["errors"], list) and payload["errors"]
+
+
+def test_quiet_suppresses_info(docx_copy: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """--quiet: при успехе stderr пуст (INFO подавлен)."""
+    code, out, err = _run(["--input", str(docx_copy), "--quiet"], capsys)
+
+    assert code == EXIT_OK
+    assert out == ""
+    assert err == ""
+
+
+def test_quiet_verbose_conflict_exit_2(
+    docx_copy: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--quiet и --verbose взаимоисключающие: argparse даёт код 2."""
+    code, _, err = _run(["--input", str(docx_copy), "--quiet", "--verbose"], capsys)
+
+    assert code == EXIT_INVALID_ARGS
+    assert "not allowed with argument" in err
+
+
+def test_json_includes_position(tmp_path: Path) -> None:
+    """changes[] в JSON содержит корректный position (индекс в тексте блока)."""
+    from src.document_processor import DocumentProcessor
+
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "src.cli",
+            "--input", str(SAMPLE_DOCX),
+            "--output", str(tmp_path / "pos.docx"),
+            "--json",
+        ],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == EXIT_OK, completed.stderr
+    payload = json.loads(completed.stdout)
+    blocks = {
+        block["block_id"]: block["text"]
+        for block in DocumentProcessor().extract_text(str(SAMPLE_DOCX))
+    }
+
+    assert payload["changes"]
+    for change in payload["changes"]:
+        assert isinstance(change["position"], int)
+        text = blocks[change["block_id"]]
+        start = change["position"]
+        assert text[start : start + len(change["original"])] == change["original"]
+
+
+def test_json_dry_run_has_no_output_field(
+    docx_copy: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--dry-run --json: отчёт без поля output (файл не создаётся)."""
+    code, out, _ = _run(["--input", str(docx_copy), "--dry-run", "--json"], capsys)
+
+    assert code == EXIT_OK
+    payload = json.loads(out)
+    assert "output" not in payload
+    assert payload["total_blocks"] == 6
+    assert isinstance(payload["changes"][0]["position"], int)
+    assert not default_output_path(docx_copy).exists()
+
+
+def test_subprocess_dry_run_stdout_is_valid_json(
+    docx_copy: Path, tmp_path: Path
+) -> None:
+    """``python -m src.cli --dry-run > report.json`` даёт валидный JSON."""
+    report_path = tmp_path / "report.json"
+
+    completed = subprocess.run(
+        [sys.executable, "-m", "src.cli", "--input", str(docx_copy), "--dry-run"],
+        cwd=str(PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == EXIT_OK, completed.stderr
+    report_path.write_text(completed.stdout, encoding="utf-8")
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["total_blocks"] > 0
+    assert not default_output_path(docx_copy).exists()
+
+
+
+@pytest.mark.parametrize(
+    ("blocks", "expected"),
+    [(0, 1), (10, 1), (19, 1), (100, 5), (400, 20), (500, 20)],
+)
+def test_auto_batch_size(blocks: int, expected: int) -> None:
+    """Авто-размер батча: max(1, min(20, блоков // 20))."""
+    from src.cli import auto_batch_size
+
+    assert auto_batch_size(blocks) == expected
+
+
+def test_auto_batch_size_is_logged(
+    docx_copy: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """При авто-выборе размер батча попадает в лог."""
+    code, _, err = _run(["--input", str(docx_copy), "--dry-run"], capsys)
+
+    assert code == EXIT_OK
+    assert "batch_size автовыбран: 1 (блоков: 6)" in err
+
+
+def test_estimate_cost_no_api_call(
+    docx_copy: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--estimate-cost печатает оценку и не делает запросов к LLM."""
+    calls: list[str] = []
+
+    class _Client:
+        """Клиент-заглушка: любой запрос означал бы регресс."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def replace_text(self, *args: Any, **kwargs: Any) -> str:
+            calls.append("called")
+            return ""
+
+    monkeypatch.setattr("src.cli.DeepSeekClient", _Client)
+
+    code, out, err = _run(
+        ["--input", str(docx_copy), "--use-llm", "--estimate-cost"], capsys
+    )
+
+    assert code == EXIT_OK
+    assert calls == [], "LLM не должна вызываться"
+    payload = json.loads(out)
+    assert set(payload) == {"estimated_input_tokens", "estimated_batches"}
+    assert payload["estimated_input_tokens"] > 0
+    assert payload["estimated_batches"] >= 1
+    assert "оценка LLM" in err
+    assert not default_output_path(docx_copy).exists()

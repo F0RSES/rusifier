@@ -1,0 +1,19 @@
+# Maintainer: TermRu contributors
+pkgname=termru-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Замена англицизмов в документах"
+arch=('x86_64')
+url=""
+license=('MIT')
+depends=()
+source=("termru-${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  install -Dm755 "${srcdir}/termru" "${pkgdir}/usr/bin/termru"
+  install -Dm644 "${srcdir}/termru.desktop" \
+    "${pkgdir}/usr/share/applications/termru.desktop"
+  install -Dm644 "${srcdir}/icon.png" \
+    "${pkgdir}/usr/share/icons/hicolor/256x256/apps/termru.png"
+}

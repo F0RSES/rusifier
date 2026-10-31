@@ -1,0 +1,40 @@
+# Виртуальное окружение
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Секреты и локальная конфигурация
+.env
+
+# Результаты работы и сборки
+output/
+build/
+dist/
+*.log
+*.tmp
+
+# Артефакты упаковки (собираются заново, в репозиторий не попадают)
+installer/
+*.spec
+packaging/arch/
+.unifypy/
+.unifypy_rollback/
+*.deb
+*.rpm
+*.AppImage
+*.tar.gz
+*.pkg.tar.*
+
+# Исследовательские скрипты этапа PDF-шрифтов (локальные;
+# итог зафиксирован в docs/pdf-font-research.md)
+scratch/
+
+# ОС/редакторы
+.DS_Store
+Thumbs.db
