@@ -30,7 +30,7 @@ termru.exe --help
 ### Debian / Ubuntu (.deb)
 
 ```bash
-sudo dpkg -i termru_0.1.0_amd64.deb
+sudo dpkg -i termru_0.2.0_amd64.deb
 sudo apt-get install -f     # если не хватает зависимостей
 termru --help
 ```

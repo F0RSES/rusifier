@@ -1,6 +1,6 @@
 # Maintainer: TermRu contributors
 pkgname=termru-bin
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="Замена англицизмов в документах"
 arch=('x86_64')

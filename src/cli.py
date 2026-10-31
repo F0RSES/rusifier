@@ -36,6 +36,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+from . import __version__
 from .deepseek_client import (
     DeepSeekClient,
     DeepSeekError,
@@ -133,6 +134,12 @@ def build_parser() -> argparse.ArgumentParser:
             "Замена англицизмов в DOCX/PPTX/PDF на русские аналоги "
             "с сохранением форматирования."
         ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="показать версию и выйти",
     )
     parser.add_argument(
         "--input",

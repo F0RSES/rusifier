@@ -2,7 +2,7 @@
   "$schema": "https://unifypy.dev/schemas/build.schema.json",
   "name": "termru",
   "display_name": "TermRu",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "entry": "termru_entry.py",
   "publisher": "TermRu contributors",
   "description": "Замена англицизмов в документах DOCX/PPTX/PDF",
