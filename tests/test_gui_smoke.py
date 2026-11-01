@@ -50,6 +50,11 @@ report["toolbar_count"] = len(toolbars)
 report["format_actions"] = [
     action.objectName() for action in window.format_toolbar.actions() if action.objectName()
 ]
+report["tools_menu"] = [
+    action.text()
+    for action in window.menuBar().actions()[2].menu().actions()
+    if not action.isSeparator()
+]
 report["status_path"] = window.status_path.text()
 report["status_counts"] = window.status_counts.text()
 report["title"] = window.windowTitle()
@@ -236,6 +241,90 @@ print(json.dumps(report, ensure_ascii=False))
 """
 )
 
+#: Проверка LLM-режима воркера с подменённым клиентом DeepSeek.
+_SCRIPT_WORKER_LLM = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtCore import QEventLoop, QTimer
+
+import src.gui.rusify as rusify
+from src.gui.rusify import RusifyWorker
+
+
+class FakeClient:
+    calls = []
+
+    def __init__(self, api_key=None, **kwargs):
+        self.api_key = api_key
+
+    def replace_text(self, text, glossary, exceptions, log_callback=None, block_id=None):
+        FakeClient.calls.append(
+            {"key": self.api_key, "block_id": block_id, "text": text}
+        )
+        return text.replace("report is ready", "отчёт готов")
+
+
+rusify.DeepSeekClient = FakeClient
+
+events = {"result": None, "error": None}
+loop = QEventLoop()
+worker = RusifyWorker("The feedback and report is ready", use_llm=True, api_key="test-key")
+worker.result_ready.connect(
+    lambda text, changes: (events.update(result=[text, list(changes)]), loop.quit())
+)
+worker.failed.connect(lambda message: (events.update(error=message), loop.quit()))
+worker.start()
+QTimer.singleShot(10000, loop.quit)
+loop.exec()
+worker.wait(3000)
+
+report["result"] = events["result"]
+report["error"] = events["error"]
+report["calls"] = FakeClient.calls
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка обработки ошибки API в LLM-режиме.
+_SCRIPT_WORKER_LLM_ERROR = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtCore import QEventLoop, QTimer
+
+import src.gui.rusify as rusify
+from src.gui.rusify import RusifyWorker
+from src.deepseek_client import DeepSeekAPIError
+
+
+class BrokenClient:
+    def __init__(self, api_key=None, **kwargs):
+        self.api_key = api_key
+
+    def replace_text(self, *args, **kwargs):
+        raise DeepSeekAPIError("Неверный ключ")
+
+
+rusify.DeepSeekClient = BrokenClient
+
+events = {"error": None}
+loop = QEventLoop()
+worker = RusifyWorker("The feedback is ready", use_llm=True, api_key="bad-key")
+worker.result_ready.connect(lambda text, changes: loop.quit())
+worker.failed.connect(lambda message: (events.update(error=message), loop.quit()))
+worker.start()
+QTimer.singleShot(10000, loop.quit)
+loop.exec()
+worker.wait(3000)
+
+report["error"] = events["error"]
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
 #: Проверка диалога предпросмотра и применения замен в редакторе.
 _SCRIPT_PREVIEW = (
     _SCRIPT_PREAMBLE
@@ -245,16 +334,17 @@ from PySide6.QtCore import Qt
 from src.gui.rusify import ReplacementsDialog
 
 changes = [
-    {"original": "feedback", "replacement": "обратная связь"},
-    {"original": "meeting", "replacement": "встреча"},
+    {"original": "feedback", "replacement": "обратная связь", "source": "dict"},
+    {"original": "meeting", "replacement": "встреча", "source": "llm"},
 ]
 dialog = ReplacementsDialog(changes, window)
 report["rows"] = dialog.table.rowCount()
 report["headers"] = [
-    dialog.table.horizontalHeaderItem(index).text() for index in range(3)
+    dialog.table.horizontalHeaderItem(index).text() for index in range(4)
 ]
+report["sources"] = [dialog.table.item(row, 2).text() for row in range(dialog.table.rowCount())]
 report["selected_before"] = [pair[0] for pair in dialog.selected_replacements()]
-dialog.table.item(1, 2).setCheckState(Qt.CheckState.Unchecked)
+dialog.table.item(1, 3).setCheckState(Qt.CheckState.Unchecked)
 report["selected_after"] = [pair[0] for pair in dialog.selected_replacements()]
 dialog.deleteLater()
 
@@ -335,6 +425,7 @@ def test_main_window_builds_ui() -> None:
     assert len(report["menus"]) == 4, report["menus"]
     assert report["toolbar_actions"] >= 3
     assert report["toolbar_count"] == 2
+    assert report["tools_menu"] == ["Настройки…", "Русифицировать документ"], report["tools_menu"]
     assert report["status_path"] == "Новый документ"
     assert report["status_counts"] == "Слов: 0 · Символов: 0"
     assert report["title"].startswith("TermRu — Редактор документов")
@@ -412,7 +503,7 @@ def test_rusify_worker_emits_signals() -> None:
     report = _run_gui_script(_SCRIPT_WORKER)
 
     assert report["error"] is None, report["error"]
-    assert report["progress"] == [10, 100], report["progress"]
+    assert report["progress"] == [10, 40, 100], report["progress"]
     assert report["result"] is not None
     new_text, changes = report["result"]
     assert new_text == "the обратная связь is clear"
@@ -420,12 +511,42 @@ def test_rusify_worker_emits_signals() -> None:
     assert report["thread_finished"] is True
 
 
+def test_rusify_worker_with_mock_llm() -> None:
+    """С use_llm воркер добавляет diff-пары от ИИ к словарным."""
+    report = _run_gui_script(_SCRIPT_WORKER_LLM)
+
+    assert report["error"] is None, report["error"]
+    assert report["result"] is not None
+    new_text, changes = report["result"]
+    assert "отчёт готов" in new_text
+
+    sources = {item["source"] for item in changes}
+    assert "dict" in sources and "llm" in sources, sources
+
+    llm_pairs = [
+        (item["original"], item["replacement"]) for item in changes if item["source"] == "llm"
+    ]
+    assert ("report is ready", "отчёт готов") in llm_pairs, llm_pairs
+
+    assert report["calls"], "LLM не вызывалась"
+    assert report["calls"][0]["key"] == "test-key"
+
+
+def test_rusify_worker_reports_api_error() -> None:
+    """Ошибка API превращается в сигнал failed с понятным текстом."""
+    report = _run_gui_script(_SCRIPT_WORKER_LLM_ERROR)
+
+    assert report["error"] is not None, "ошибка не передана"
+    assert "Ошибка API" in report["error"], report["error"]
+
+
 def test_replacements_dialog_and_apply() -> None:
     """Диалог показывает замены, галочки снимаются, текст применяется."""
     report = _run_gui_script(_SCRIPT_PREVIEW)
 
     assert report["rows"] == 2
-    assert report["headers"] == ["Оригинал", "Замена", "Применить"]
+    assert report["headers"] == ["Оригинал", "Замена", "Источник", "Применить"]
+    assert report["sources"] == ["Словарь", "ИИ"], report["sources"]
     assert report["selected_before"] == ["feedback", "meeting"]
     assert report["selected_after"] == ["feedback"], "снятая галочка не учтена"
 

@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
 
 from .docx_editor import DocxEditor
 from .rusify import ReplacementsDialog, RusifyWorker
+from .settings import SettingsDialog, load_settings
 
 APP_TITLE = "TermRu — Редактор документов"
 DOCX_FILTER = "Документы Word (*.docx)"
@@ -134,6 +135,13 @@ class MainWindow(QMainWindow):
         )
         self.action_russify.triggered.connect(self.russify_document)
 
+        self.action_settings = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            "Настройки…",
+            self,
+        )
+        self.action_settings.triggered.connect(self.open_settings)
+
         self.action_about = QAction("О программе", self)
         self.action_about.triggered.connect(self.show_about)
 
@@ -174,6 +182,8 @@ class MainWindow(QMainWindow):
         paste.triggered.connect(self.editor.paste)
 
         tools_menu = menubar.addMenu("&Инструменты")
+        tools_menu.addAction(self.action_settings)
+        tools_menu.addSeparator()
         tools_menu.addAction(self.action_russify)
 
         help_menu = menubar.addMenu("С&правка")
@@ -564,6 +574,21 @@ class MainWindow(QMainWindow):
         return True
 
     # -- инструменты ---------------------------------------------------------
+    def open_settings(self) -> None:
+        """Открыть диалог настроек DeepSeek.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        dialog = SettingsDialog(self)
+        if dialog.exec() == SettingsDialog.DialogCode.Accepted:
+            state = load_settings()
+            mode = "ИИ + словарь" if state["use_llm"] else "только словарь"
+            self.statusBar().showMessage(f"Настройки сохранены ({mode})", 4000)
+
     def russify_document(self) -> None:
         """Запустить русификацию в фоне и показать предпросмотр замен.
 
@@ -585,6 +610,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_worker", None) is not None and self._worker.isRunning():
             return
 
+        settings = load_settings()
         self._rusify_cancelled = False
         self._progress = QProgressDialog("Идёт анализ документа…", "Отмена", 0, 100, self)
         self._progress.setWindowTitle("Русификация")
@@ -595,7 +621,12 @@ class MainWindow(QMainWindow):
 
         self.editor.setReadOnly(True)
 
-        self._worker = RusifyWorker(text, parent=self)
+        self._worker = RusifyWorker(
+            text,
+            parent=self,
+            use_llm=settings["use_llm"],
+            api_key=settings["api_key"],
+        )
         self._worker.progress.connect(self._progress.setValue)
         self._worker.result_ready.connect(self._on_rusify_ready)
         self._worker.failed.connect(self._on_rusify_failed)
