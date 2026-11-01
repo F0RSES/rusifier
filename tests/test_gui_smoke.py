@@ -28,7 +28,7 @@ import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QToolBar
+from PySide6.QtWidgets import QApplication, QTabWidget, QToolBar
 
 from src.gui.docx_editor import DocxEditor
 from src.gui.main_window import MainWindow
@@ -43,7 +43,12 @@ _SCRIPT_UI = (
     _SCRIPT_PREAMBLE
     + """
 toolbars = window.findChildren(QToolBar)
-report["central_is_editor"] = isinstance(window.centralWidget(), DocxEditor)
+report["central_is_tabs"] = isinstance(window.centralWidget(), QTabWidget)
+report["tab_titles"] = [
+    window.tabs.tabText(index) for index in range(window.tabs.count())
+]
+report["word_editor_in_tab0"] = window.tabs.widget(0) is window.editor
+report["pptx_editor_in_tab1"] = window.tabs.widget(1) is window.pptx_editor
 report["menus"] = [action.text() for action in window.menuBar().actions()]
 report["toolbar_actions"] = len(toolbars[0].actions()) if toolbars else 0
 report["toolbar_count"] = len(toolbars)
@@ -367,6 +372,228 @@ print(json.dumps(report, ensure_ascii=False))
 )
 
 
+#: Проверка загрузки PPTX: список слайдов, блоки, пустой слайд, битый файл.
+_SCRIPT_PPTX_LOAD = (
+    _SCRIPT_PREAMBLE
+    + """
+from pathlib import Path
+
+from pptx import Presentation
+from pptx.util import Inches
+from PySide6.QtWidgets import QLabel
+
+import src.gui.main_window as main_window
+import src.gui.pptx_editor as pptx_module
+
+path = sys.argv[1]
+
+prs = Presentation()
+slide = prs.slides.add_slide(prs.slide_layouts[1])
+slide.shapes.title.text = "Quarterly feedback"
+body = slide.placeholders[1]
+body.text = "first line"
+body.text_frame.add_paragraph().text = "second line"
+
+table_slide = prs.slides.add_slide(prs.slide_layouts[6])
+frame = table_slide.shapes.add_table(1, 2, Inches(1), Inches(1), Inches(5), Inches(1))
+frame.table.cell(0, 0).text = "TLS handshake"
+frame.table.cell(0, 1).text = "milestone owner"
+
+prs.slides.add_slide(prs.slide_layouts[6])
+prs.save(path)
+
+report["opened"] = window.open_path(path)
+report["active_tab"] = window.tabs.currentIndex()
+report["tab_title"] = window.tabs.tabText(window.tabs.currentIndex())
+
+editor = window.pptx_editor
+report["slide_count"] = editor.slide_list.count()
+report["slide_names"] = [
+    editor.slide_list.item(index).text() for index in range(editor.slide_list.count())
+]
+report["blocks_slide0"] = editor.block_count()
+report["captions_slide0"] = editor.block_captions()
+report["texts_slide0"] = editor.block_texts()
+report["modified_after_load"] = editor.is_modified()
+report["status_path"] = window.status_path.text()
+report["status_counts"] = window.status_counts.text()
+report["title"] = window.windowTitle()
+report["russify_label"] = window.action_russify.text()
+report["format_hidden"] = window.format_toolbar.isHidden()
+
+# Таблица на слайде тоже даёт текстовые блоки -- по одному на ячейку.
+editor.select_slide(1)
+report["table_blocks"] = editor.block_count()
+report["table_texts"] = editor.block_texts()
+report["table_captions"] = editor.block_captions()
+
+# Пустой слайд: полей нет, показана заглушка.
+editor.select_slide(2)
+report["blank_blocks"] = editor.block_count()
+hint = editor.findChild(QLabel, "emptyHint")
+report["blank_hint"] = hint.text() if hint is not None else None
+
+# Русификация пустого слайда: сообщение вместо запуска воркера.
+messages = []
+main_window.QMessageBox.information = (
+    lambda *args, **kwargs: messages.append(list(args[1:3]))
+)
+window.russify_document()
+report["empty_message"] = messages
+report["worker_after_empty"] = getattr(window, "_worker", None) is not None
+
+# Правка сохраняется при переходе на другой слайд и обратно.
+editor.select_slide(0)
+editor.block_editors()[0].setPlainText("Черновик заголовка")
+report["modified_after_edit"] = editor.is_modified()
+editor.select_slide(2)
+editor.select_slide(0)
+report["text_after_switch"] = editor.block_texts()[0]
+
+# Битый файл: ошибка в диалоге, открытая презентация остаётся на месте.
+errors = []
+pptx_module.QMessageBox.critical = lambda *args, **kwargs: errors.append(list(args[1:3]))
+broken = Path(path).with_name("broken.pptx")
+broken.write_bytes(b"this is not a presentation")
+report["broken_result"] = editor.load_file(str(broken))
+report["broken_error"] = bool(errors)
+report["slides_after_error"] = editor.slide_count()
+report["text_kept_after_error"] = editor.block_texts()[0]
+
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+#: Проверка сохранения PPTX: правка QTextEdit доезжает до файла.
+_SCRIPT_PPTX_SAVE = (
+    _SCRIPT_PREAMBLE
+    + """
+from pptx import Presentation
+
+src, dst = sys.argv[1], sys.argv[2]
+
+prs = Presentation()
+slide = prs.slides.add_slide(prs.slide_layouts[1])
+title = slide.shapes.title
+title.text = "Quarterly feedback"
+title.text_frame.paragraphs[0].runs[0].font.bold = True
+body = slide.placeholders[1]
+body.text = "first line"
+body.text_frame.add_paragraph().text = "second line"
+prs.save(src)
+
+editor = window.pptx_editor
+report["opened"] = editor.load_file(src)
+report["blocks_before"] = editor.block_texts()
+
+editors = editor.block_editors()
+editors[0].setPlainText("Ежеквартальный отчёт")
+editors[1].setPlainText("строка один\\nстрока два")
+report["modified_before_save"] = editor.is_modified()
+
+report["saved"] = editor.save_file(dst)
+report["modified_after_save"] = editor.is_modified()
+report["current_path"] = editor.current_path.name
+
+back = Presentation(dst)
+report["saved_slides"] = len(back.slides)
+report["saved_texts"] = [
+    shape.text_frame.text for shape in back.slides[0].shapes if shape.has_text_frame
+]
+report["saved_title_runs"] = [
+    [run.text, bool(run.font.bold)]
+    for paragraph in back.slides[0].shapes.title.text_frame.paragraphs
+    for run in paragraph.runs
+]
+
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка русификации на вкладке PPTX: маршрутизация замен и запуск воркера.
+_SCRIPT_PPTX_RUSIFY = (
+    _SCRIPT_PREAMBLE
+    + """
+from pptx import Presentation
+
+import src.gui.main_window as main_window
+
+src, dst = sys.argv[1], sys.argv[2]
+
+prs = Presentation()
+slide = prs.slides.add_slide(prs.slide_layouts[1])
+slide.shapes.title.text = "Product feedback"
+slide.shapes.title.text_frame.paragraphs[0].runs[0].font.bold = True
+slide.placeholders[1].text = "meeting notes"
+prs.save(src)
+
+# Диалоги не показываем: подменяем на «Применить»/«Отмена» без окна.
+main_window.QMessageBox.information = lambda *args, **kwargs: None
+main_window.QMessageBox.question = lambda *args, **kwargs: None
+main_window.ReplacementsDialog.exec = (
+    lambda self: main_window.ReplacementsDialog.DialogCode.Accepted
+)
+main_window.ReplacementsDialog.selected_replacements = lambda self: [
+    ("feedback", "обратная связь"),
+    ("meeting", "встреча"),
+    ("нет такого", "x"),
+]
+
+editor = window.pptx_editor
+report["opened"] = window.open_path(src)
+report["texts_before"] = editor.block_texts()
+report["current_text_before"] = editor.current_text()
+
+# Ветка применения: _on_rusify_ready направляет замены в PPTX-редактор.
+window._rusify_target = "pptx"
+window._on_rusify_ready(
+    "",
+    [
+        {"original": "feedback", "replacement": "обратная связь", "source": "dict"},
+        {"original": "meeting", "replacement": "встреча", "source": "llm"},
+    ],
+)
+report["texts_after_ready"] = editor.block_texts()
+report["status_after_ready"] = window.statusBar().currentMessage()
+report["modified_after_ready"] = editor.is_modified()
+
+report["saved"] = editor.save_file(dst)
+back = Presentation(dst)
+report["saved_texts"] = [
+    shape.text_frame.text for shape in back.slides[0].shapes if shape.has_text_frame
+]
+report["bold_after"] = [
+    bool(run.font.bold)
+    for paragraph in back.slides[0].shapes.title.text_frame.paragraphs
+    for run in paragraph.runs
+]
+
+# Ветка запуска: кнопка берёт текст слайда и блокирует правку на время работы.
+main_window.ReplacementsDialog.exec = (
+    lambda self: main_window.ReplacementsDialog.DialogCode.Rejected
+)
+window.russify_document()
+report["worker_started"] = window._worker is not None and window._worker.isRunning()
+report["worker_text"] = window._worker._text
+report["editors_locked"] = all(
+    block.isReadOnly() for block in editor.block_editors()
+)
+report["slide_list_locked"] = not editor.slide_list.isEnabled()
+window._worker.wait(20000)
+report["worker_progressed"] = window._worker.isFinished()
+
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
 def _gui_environment() -> dict[str, str]:
     """Окружение подпроцесса: offscreen и Qt-библиотеки из PySide6.
 
@@ -418,10 +645,13 @@ def _run_gui_script(script: str, *args: str) -> dict:
 
 
 def test_main_window_builds_ui() -> None:
-    """Окно содержит меню, панель инструментов, редактор и статус-бар."""
+    """Окно содержит вкладки, меню, панель инструментов и статус-бар."""
     report = _run_gui_script(_SCRIPT_UI)
 
-    assert report["central_is_editor"] is True
+    assert report["central_is_tabs"] is True
+    assert report["tab_titles"] == ["Word (DOCX)", "PowerPoint (PPTX)"], report["tab_titles"]
+    assert report["word_editor_in_tab0"] is True
+    assert report["pptx_editor_in_tab1"] is True
     assert len(report["menus"]) == 4, report["menus"]
     assert report["toolbar_actions"] >= 3
     assert report["toolbar_count"] == 2
@@ -553,6 +783,104 @@ def test_replacements_dialog_and_apply() -> None:
     assert report["applied"] == 2
     assert report["text_after"] == "the обратная связь and встреча are here"
     assert report["bold_kept"] is True, "замена потеряла жирное начертание"
+
+
+def test_pptx_editor_load(tmp_path: Path) -> None:
+    """PPTX открывается: список слайдов, блоки, пустой слайд, битый файл."""
+    path = tmp_path / "deck.pptx"
+    report = _run_gui_script(_SCRIPT_PPTX_LOAD, str(path))
+
+    assert report["opened"] is True
+    assert report["active_tab"] == 1, "вкладка не переключилась на PPTX"
+    assert report["tab_title"] == "PowerPoint (PPTX)"
+
+    assert report["slide_count"] == 3, report["slide_names"]
+    assert report["slide_names"] == [
+        "Слайд 1: Quarterly feedback",
+        "Слайд 2",
+        "Слайд 3",
+    ], report["slide_names"]
+
+    assert report["blocks_slide0"] == 2
+    assert report["captions_slide0"][0].startswith("Заголовок")
+    assert report["captions_slide0"][1].startswith("Содержимое")
+    assert report["texts_slide0"] == ["Quarterly feedback", "first line\nsecond line"]
+    assert report["modified_after_load"] is False
+
+    assert report["status_path"] == str(path)
+    assert report["status_counts"] == "Слайдов: 3 · Блоков: 2", report["status_counts"]
+    assert report["title"] == f"TermRu — Редактор документов — deck.pptx[*]"
+    assert report["russify_label"] == "Русифицировать слайд"
+    assert report["format_hidden"] is True, "панель форматирования DOCX осталась видна"
+
+    assert report["table_blocks"] == 2, "ячейки таблицы не попали в редактор"
+    assert report["table_texts"] == ["TLS handshake", "milestone owner"]
+    assert "R1C1" in report["table_captions"][0], report["table_captions"]
+    assert "R1C2" in report["table_captions"][1], report["table_captions"]
+
+    assert report["blank_blocks"] == 0
+    assert report["blank_hint"] == "Нет текстовых блоков", report["blank_hint"]
+
+    assert report["empty_message"], "нет сообщения о пустом слайде"
+    assert report["empty_message"][0][1] == "На слайде нет текста."
+    assert report["worker_after_empty"] is False, "воркер запустился для пустого слайда"
+
+    assert report["modified_after_edit"] is True
+    assert report["text_after_switch"] == "Черновик заголовка", "правка потерялась"
+
+    assert report["broken_result"] is False
+    assert report["broken_error"] is True, "ошибка открытия не показана"
+    assert report["slides_after_error"] == 3, "битый файл сбросил открытую презентацию"
+    assert report["text_kept_after_error"] == "Черновик заголовка"
+
+
+def test_pptx_editor_save(tmp_path: Path) -> None:
+    """Изменённый текст QTextEdit сохраняется в PPTX без потери жирного."""
+    source = tmp_path / "in.pptx"
+    target = tmp_path / "out.pptx"
+
+    report = _run_gui_script(_SCRIPT_PPTX_SAVE, str(source), str(target))
+
+    assert report["opened"] is True
+    assert report["blocks_before"] == ["Quarterly feedback", "first line\nsecond line"]
+    assert report["modified_before_save"] is True
+
+    assert report["saved"] is True
+    assert target.is_file()
+    assert report["modified_after_save"] is False
+    assert report["current_path"] == "out.pptx"
+
+    assert report["saved_slides"] == 1
+    assert report["saved_texts"] == [
+        "Ежеквартальный отчёт",
+        "строка один\nстрока два",
+    ], report["saved_texts"]
+    assert report["saved_title_runs"] == [["Ежеквартальный отчёт", True]]
+
+
+def test_pptx_rusify_flow(tmp_path: Path) -> None:
+    """Русификация на вкладке PPTX правит слайд и запускает воркер."""
+    source = tmp_path / "in.pptx"
+    target = tmp_path / "out.pptx"
+
+    report = _run_gui_script(_SCRIPT_PPTX_RUSIFY, str(source), str(target))
+
+    assert report["opened"] is True
+    assert report["current_text_before"] == "Product feedback\n\nmeeting notes"
+
+    assert report["texts_after_ready"] == ["Product обратная связь", "встреча notes"]
+    assert report["status_after_ready"] == "Применено замен: 2"
+    assert report["modified_after_ready"] is True
+
+    assert report["saved"] is True
+    assert report["saved_texts"] == ["Product обратная связь", "встреча notes"]
+    assert report["bold_after"] == [True], "замена потеряла жирное начертание"
+
+    assert report["worker_started"] is True, "воркер не запустился"
+    assert report["worker_text"] == "Product обратная связь\n\nвстреча notes"
+    assert report["editors_locked"] is True, "правка не заблокирована на время работы"
+    assert report["slide_list_locked"] is True, "список слайдов не заблокирован"
+    assert report["worker_progressed"] is True
 
 
 def test_gui_entrypoint_imports() -> None:
