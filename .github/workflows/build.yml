@@ -45,18 +45,20 @@ jobs:
               print(f"fixture created: {path}")
           PY
       # --skip-installer: установщик Inno Setup на раннере не нужен и не соберётся.
-      # strip на Windows не передаётся (его нет в unifypy.json — см. build-deb.sh).
+      # strip на Windows не передаётся: unifypy не имеет CLI-флага --strip, а в
+      # общем unifypy.json его нет — Linux включает его через build-deb.sh.
+      # --verbose: полный лог PyInstaller сразу пишется в unifypy-build.log.
       - name: Build exe
         shell: bash
         run: |
           set -o pipefail
           python -m unifypy . --config unifypy.json --format exe --onefile \
-            --skip-installer --clean 2>&1 | tee unifypy-build.log
+            --skip-installer --clean --verbose 2>&1 | tee unifypy-build.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            echo "::error::unifypy упал (exit $status), повтор с --verbose для логов"
+            echo "::error::unifypy упал (exit $status), повтор без кэша"
             python -m unifypy . --config unifypy.json --format exe --onefile \
-              --skip-installer --clean --verbose 2>&1 | tee -a unifypy-build.log
+              --skip-installer --clean 2>&1 | tee -a unifypy-build.log
             status=${PIPESTATUS[0]}
           fi
           exit "$status"
@@ -121,6 +123,10 @@ jobs:
               print(f"fixture created: {path}")
           PY
       - name: Build deb (unifypy + .desktop post-processing)
+        # strip=on передаётся внутри скрипта: unifypy не поддерживает CLI-флаг
+        # --strip (только ключ pyinstaller.strip в конфиге). Скрипт собирает
+        # временный конфиг с strip и вызывает unifypy с ним — так флаг остаётся
+        # Linux-only и Windows-сборку не затрагивает.
         run: packaging/build-deb.sh
       - name: Desktop post-processing test
         run: bash tests/test_deb_desktop.sh
