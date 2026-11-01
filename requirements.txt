@@ -4,3 +4,10 @@ openai
 python-dotenv
 unifypy
 pytest
+
+# GUI (этап 7). Взяты аналоги заявленных библиотек: docwow ограничен
+# Python < 3.11, а pyqtdarktheme — < 3.12, проект работает на 3.13.
+PySide6-Essentials>=6.8.0
+mammoth>=1.13.0
+html2docx>=1.6.0
+qdarkstyle>=3.2.0
