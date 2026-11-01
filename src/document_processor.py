@@ -73,6 +73,9 @@ from .pdf_fonts import (
 __all__ = [
     "DocumentProcessor",
     "DocumentProcessingError",
+    "PDF_OWN_FONT_PREFIXES",
+    "PDF_SUBSET_FONT_PREFIX",
+    "PDF_SUBSTITUTED_FONT_PREFIX",
     "SUPPORTED_FORMATS",
     "UnsupportedFormatError",
 ]
@@ -157,6 +160,7 @@ _PDF_ENGINE_LOGGER = "pdf_edit_engine"
 #: когда сдвигать контент ниже некуда (последний блок страницы) — строки наезжают.
 DEFAULT_PDF_LINE_HEIGHT = 1.2
 
+
 #: Минимальный кегль, до которого допустимо уменьшать текст в режиме ``fit="shrink"``.
 DEFAULT_PDF_MIN_FONT_SIZE = 8.0
 
@@ -165,6 +169,17 @@ _APPLIED_FONT_SIZE_RE = re.compile(r"applied=([0-9]+(?:\.[0-9]+)?)")
 
 #: ``16.8pt`` из сообщения движка об overflow (число есть не всегда).
 _OVERFLOW_PT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*pt", re.IGNORECASE)
+
+#: Префикс ресурса Type0-шрифта, который TermRu внедряет для кириллицы.
+PDF_SUBSET_FONT_PREFIX = "TFCyr"
+
+#: Префикс ресурса шрифта, подставленного вместо неподходящего шрифта блока.
+PDF_SUBSTITUTED_FONT_PREFIX = "TFSub"
+
+#: Префиксы, по которым видно, что PDF уже проходил обработку TermRu.
+#: Повторная запись такого файла не гарантирует сохранность текста: движок
+#: пересобирает страницы и перекодирует уже подставленные шрифты.
+PDF_OWN_FONT_PREFIXES = (PDF_SUBSET_FONT_PREFIX, PDF_SUBSTITUTED_FONT_PREFIX)
 
 
 class _PdfEngineNoiseCounter(logging.Handler):
@@ -1345,7 +1360,7 @@ class DocumentProcessor:
 
             names: dict[tuple[int, str], str] = {}
             for index, ((page_no, ttf_path), chars) in enumerate(sorted(groups.items())):
-                name = f"TFCyr{index}"
+                name = f"{PDF_SUBSET_FONT_PREFIX}{index}"
                 add_cyrillic_font(
                     pdf,
                     pdf.pages[page_no],
@@ -1475,7 +1490,7 @@ class DocumentProcessor:
             self._log("error", f"Блок {block_id}: {MISSING_FONT_MESSAGE}")
             return None
 
-        name = f"TFSub{block_id}"
+        name = f"{PDF_SUBSTITUTED_FONT_PREFIX}{block_id}"
         chars = "".join(sorted(set(new_text)))
         try:
             with pikepdf.open(str(current)) as pdf:

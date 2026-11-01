@@ -22,7 +22,9 @@ fi
 
 echo "==> Очистка кеша spec и прошлых артефактов"
 rm -rf "$PROJECT_ROOT/build" "$PROJECT_ROOT/dist" "$PROJECT_ROOT/installer"
-rm -f "$PROJECT_ROOT/termru.spec"
+# Имя spec берётся из "name" в unifypy.json (сейчас TermRu); старое имя тоже
+# удаляем, чтобы не остался устаревший кеш после переименования.
+rm -f "$PROJECT_ROOT/termru.spec" "$PROJECT_ROOT/TermRu.spec"
 
 # strip имеет смысл только на Linux/macOS: в общем unifypy.json его нет,
 # иначе Windows-сборка получает чужие флаги. Готовим временный конфиг.
@@ -48,8 +50,31 @@ for deb in "$PROJECT_ROOT"/installer/*.deb; do
   bash "$PROJECT_ROOT/packaging/fix-deb-desktop.sh" "$deb"
 done
 
-echo "==> Артефакты"
-if compgen -G "$PROJECT_ROOT/installer/*.deb" > /dev/null; then
-  cp "$PROJECT_ROOT"/installer/*.deb "$PROJECT_ROOT/dist/"
+# dist/ остаётся распакованным бандлом: обрезаем его так же, как payload .deb,
+# иначе артефакт в dist/ и в пакете расходятся по размеру и содержимому.
+if [[ -d "$PROJECT_ROOT/dist/TermRu/_internal" ]]; then
+  echo "==> Обрезка dist/TermRu"
+  "$PYTHON" "$PROJECT_ROOT/packaging/trim_bundle.py" "$PROJECT_ROOT/dist/TermRu"
 fi
-ls -lh "$PROJECT_ROOT/dist"
+
+echo "==> Артефакты"
+mkdir -p "$PROJECT_ROOT/dist"
+for deb in "$PROJECT_ROOT"/installer/*.deb; do
+  [[ -f "$deb" ]] || continue
+  # unifypy называет файл по "name" (TermRu_0.2.0_amd64.deb), а пакет и
+  # привычное имя файла — termru: приводим к нижнему регистру.
+  target="$PROJECT_ROOT/dist/$(basename "$deb" | sed 's/^TermRu_/termru_/')"
+  cp -f "$deb" "$target"
+done
+ls -lh "$PROJECT_ROOT"/dist/*.deb
+
+echo "==> Проверка размера (предел 100 МБ)"
+for deb in "$PROJECT_ROOT"/dist/*.deb; do
+  [[ -f "$deb" ]] || continue
+  size_mb=$(( $(stat -c%s "$deb") / 1024 / 1024 ))
+  echo "    $(basename "$deb"): ${size_mb} МиБ"
+  if (( size_mb > 100 )); then
+    echo "ОШИБКА: пакет больше 100 МБ (${size_mb} МиБ) — проверьте exclude_module" >&2
+    exit 1
+  fi
+done

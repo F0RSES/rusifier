@@ -28,7 +28,7 @@ import sys
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QToolBar
+from PySide6.QtWidgets import QApplication, QTabWidget, QToolBar
 
 from src.gui.docx_editor import DocxEditor
 from src.gui.main_window import MainWindow
@@ -43,12 +43,23 @@ _SCRIPT_UI = (
     _SCRIPT_PREAMBLE
     + """
 toolbars = window.findChildren(QToolBar)
-report["central_is_editor"] = isinstance(window.centralWidget(), DocxEditor)
+report["central_is_tabs"] = isinstance(window.centralWidget(), QTabWidget)
+report["tab_titles"] = [
+    window.tabs.tabText(index) for index in range(window.tabs.count())
+]
+report["word_editor_in_tab0"] = window.tabs.widget(0) is window.editor
+report["pptx_editor_in_tab1"] = window.tabs.widget(1) is window.pptx_editor
+report["pdf_editor_in_tab2"] = window.tabs.widget(2) is window.pdf_editor
 report["menus"] = [action.text() for action in window.menuBar().actions()]
 report["toolbar_actions"] = len(toolbars[0].actions()) if toolbars else 0
 report["toolbar_count"] = len(toolbars)
 report["format_actions"] = [
     action.objectName() for action in window.format_toolbar.actions() if action.objectName()
+]
+report["tools_menu"] = [
+    action.text()
+    for action in window.menuBar().actions()[2].menu().actions()
+    if not action.isSeparator()
 ]
 report["status_path"] = window.status_path.text()
 report["status_counts"] = window.status_counts.text()
@@ -236,6 +247,90 @@ print(json.dumps(report, ensure_ascii=False))
 """
 )
 
+#: Проверка LLM-режима воркера с подменённым клиентом DeepSeek.
+_SCRIPT_WORKER_LLM = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtCore import QEventLoop, QTimer
+
+import src.gui.rusify as rusify
+from src.gui.rusify import RusifyWorker
+
+
+class FakeClient:
+    calls = []
+
+    def __init__(self, api_key=None, **kwargs):
+        self.api_key = api_key
+
+    def replace_text(self, text, glossary, exceptions, log_callback=None, block_id=None):
+        FakeClient.calls.append(
+            {"key": self.api_key, "block_id": block_id, "text": text}
+        )
+        return text.replace("report is ready", "отчёт готов")
+
+
+rusify.DeepSeekClient = FakeClient
+
+events = {"result": None, "error": None}
+loop = QEventLoop()
+worker = RusifyWorker("The feedback and report is ready", use_llm=True, api_key="test-key")
+worker.result_ready.connect(
+    lambda text, changes: (events.update(result=[text, list(changes)]), loop.quit())
+)
+worker.failed.connect(lambda message: (events.update(error=message), loop.quit()))
+worker.start()
+QTimer.singleShot(10000, loop.quit)
+loop.exec()
+worker.wait(3000)
+
+report["result"] = events["result"]
+report["error"] = events["error"]
+report["calls"] = FakeClient.calls
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка обработки ошибки API в LLM-режиме.
+_SCRIPT_WORKER_LLM_ERROR = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtCore import QEventLoop, QTimer
+
+import src.gui.rusify as rusify
+from src.gui.rusify import RusifyWorker
+from src.deepseek_client import DeepSeekAPIError
+
+
+class BrokenClient:
+    def __init__(self, api_key=None, **kwargs):
+        self.api_key = api_key
+
+    def replace_text(self, *args, **kwargs):
+        raise DeepSeekAPIError("Неверный ключ")
+
+
+rusify.DeepSeekClient = BrokenClient
+
+events = {"error": None}
+loop = QEventLoop()
+worker = RusifyWorker("The feedback is ready", use_llm=True, api_key="bad-key")
+worker.result_ready.connect(lambda text, changes: loop.quit())
+worker.failed.connect(lambda message: (events.update(error=message), loop.quit()))
+worker.start()
+QTimer.singleShot(10000, loop.quit)
+loop.exec()
+worker.wait(3000)
+
+report["error"] = events["error"]
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
 #: Проверка диалога предпросмотра и применения замен в редакторе.
 _SCRIPT_PREVIEW = (
     _SCRIPT_PREAMBLE
@@ -245,16 +340,17 @@ from PySide6.QtCore import Qt
 from src.gui.rusify import ReplacementsDialog
 
 changes = [
-    {"original": "feedback", "replacement": "обратная связь"},
-    {"original": "meeting", "replacement": "встреча"},
+    {"original": "feedback", "replacement": "обратная связь", "source": "dict"},
+    {"original": "meeting", "replacement": "встреча", "source": "llm"},
 ]
 dialog = ReplacementsDialog(changes, window)
 report["rows"] = dialog.table.rowCount()
 report["headers"] = [
-    dialog.table.horizontalHeaderItem(index).text() for index in range(3)
+    dialog.table.horizontalHeaderItem(index).text() for index in range(4)
 ]
+report["sources"] = [dialog.table.item(row, 2).text() for row in range(dialog.table.rowCount())]
 report["selected_before"] = [pair[0] for pair in dialog.selected_replacements()]
-dialog.table.item(1, 2).setCheckState(Qt.CheckState.Unchecked)
+dialog.table.item(1, 3).setCheckState(Qt.CheckState.Unchecked)
 report["selected_after"] = [pair[0] for pair in dialog.selected_replacements()]
 dialog.deleteLater()
 
@@ -271,6 +367,713 @@ html_after = window.editor.toHtml()
 report["bold_kept"] = "font-weight:700" in html_after and "обратная связь" in html_after
 
 window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+#: Проверка загрузки PPTX: список слайдов, блоки, пустой слайд, битый файл.
+_SCRIPT_PPTX_LOAD = (
+    _SCRIPT_PREAMBLE
+    + """
+from pathlib import Path
+
+from pptx import Presentation
+from pptx.util import Inches
+from PySide6.QtWidgets import QLabel
+
+import src.gui.main_window as main_window
+import src.gui.pptx_editor as pptx_module
+
+path = sys.argv[1]
+
+prs = Presentation()
+slide = prs.slides.add_slide(prs.slide_layouts[1])
+slide.shapes.title.text = "Quarterly feedback"
+body = slide.placeholders[1]
+body.text = "first line"
+body.text_frame.add_paragraph().text = "second line"
+
+table_slide = prs.slides.add_slide(prs.slide_layouts[6])
+frame = table_slide.shapes.add_table(1, 2, Inches(1), Inches(1), Inches(5), Inches(1))
+frame.table.cell(0, 0).text = "TLS handshake"
+frame.table.cell(0, 1).text = "milestone owner"
+
+prs.slides.add_slide(prs.slide_layouts[6])
+prs.save(path)
+
+report["opened"] = window.open_path(path)
+report["active_tab"] = window.tabs.currentIndex()
+report["tab_title"] = window.tabs.tabText(window.tabs.currentIndex())
+
+editor = window.pptx_editor
+report["slide_count"] = editor.slide_list.count()
+report["slide_names"] = [
+    editor.slide_list.item(index).text() for index in range(editor.slide_list.count())
+]
+report["blocks_slide0"] = editor.block_count()
+report["captions_slide0"] = editor.block_captions()
+report["texts_slide0"] = editor.block_texts()
+report["modified_after_load"] = editor.is_modified()
+report["status_path"] = window.status_path.text()
+report["status_counts"] = window.status_counts.text()
+report["title"] = window.windowTitle()
+report["russify_label"] = window.action_russify.text()
+report["format_hidden"] = window.format_toolbar.isHidden()
+
+# Таблица на слайде тоже даёт текстовые блоки -- по одному на ячейку.
+editor.select_slide(1)
+report["table_blocks"] = editor.block_count()
+report["table_texts"] = editor.block_texts()
+report["table_captions"] = editor.block_captions()
+
+# Пустой слайд: полей нет, показана заглушка.
+editor.select_slide(2)
+report["blank_blocks"] = editor.block_count()
+hint = editor.findChild(QLabel, "emptyHint")
+report["blank_hint"] = hint.text() if hint is not None else None
+
+# Русификация пустого слайда: сообщение вместо запуска воркера.
+messages = []
+main_window.QMessageBox.information = (
+    lambda *args, **kwargs: messages.append(list(args[1:3]))
+)
+window.russify_document()
+report["empty_message"] = messages
+report["worker_after_empty"] = getattr(window, "_worker", None) is not None
+
+# Правка сохраняется при переходе на другой слайд и обратно.
+editor.select_slide(0)
+editor.block_editors()[0].setPlainText("Черновик заголовка")
+report["modified_after_edit"] = editor.is_modified()
+editor.select_slide(2)
+editor.select_slide(0)
+report["text_after_switch"] = editor.block_texts()[0]
+
+# Битый файл: ошибка в диалоге, открытая презентация остаётся на месте.
+errors = []
+pptx_module.QMessageBox.critical = lambda *args, **kwargs: errors.append(list(args[1:3]))
+broken = Path(path).with_name("broken.pptx")
+broken.write_bytes(b"this is not a presentation")
+report["broken_result"] = editor.load_file(str(broken))
+report["broken_error"] = bool(errors)
+report["slides_after_error"] = editor.slide_count()
+report["text_kept_after_error"] = editor.block_texts()[0]
+
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+#: Проверка сохранения PPTX: правка QTextEdit доезжает до файла.
+_SCRIPT_PPTX_SAVE = (
+    _SCRIPT_PREAMBLE
+    + """
+from pptx import Presentation
+
+src, dst = sys.argv[1], sys.argv[2]
+
+prs = Presentation()
+slide = prs.slides.add_slide(prs.slide_layouts[1])
+title = slide.shapes.title
+title.text = "Quarterly feedback"
+title.text_frame.paragraphs[0].runs[0].font.bold = True
+body = slide.placeholders[1]
+body.text = "first line"
+body.text_frame.add_paragraph().text = "second line"
+prs.save(src)
+
+editor = window.pptx_editor
+report["opened"] = editor.load_file(src)
+report["blocks_before"] = editor.block_texts()
+
+editors = editor.block_editors()
+editors[0].setPlainText("Ежеквартальный отчёт")
+editors[1].setPlainText("строка один\\nстрока два")
+report["modified_before_save"] = editor.is_modified()
+
+report["saved"] = editor.save_file(dst)
+report["modified_after_save"] = editor.is_modified()
+report["current_path"] = editor.current_path.name
+
+back = Presentation(dst)
+report["saved_slides"] = len(back.slides)
+report["saved_texts"] = [
+    shape.text_frame.text for shape in back.slides[0].shapes if shape.has_text_frame
+]
+report["saved_title_runs"] = [
+    [run.text, bool(run.font.bold)]
+    for paragraph in back.slides[0].shapes.title.text_frame.paragraphs
+    for run in paragraph.runs
+]
+
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка русификации на вкладке PPTX: маршрутизация замен и запуск воркера.
+_SCRIPT_PPTX_RUSIFY = (
+    _SCRIPT_PREAMBLE
+    + """
+from pptx import Presentation
+
+import src.gui.main_window as main_window
+
+src, dst = sys.argv[1], sys.argv[2]
+
+prs = Presentation()
+slide = prs.slides.add_slide(prs.slide_layouts[1])
+slide.shapes.title.text = "Product feedback"
+slide.shapes.title.text_frame.paragraphs[0].runs[0].font.bold = True
+slide.placeholders[1].text = "meeting notes"
+prs.save(src)
+
+# Диалоги не показываем: подменяем на «Применить»/«Отмена» без окна.
+main_window.QMessageBox.information = lambda *args, **kwargs: None
+main_window.QMessageBox.question = lambda *args, **kwargs: None
+main_window.ReplacementsDialog.exec = (
+    lambda self: main_window.ReplacementsDialog.DialogCode.Accepted
+)
+main_window.ReplacementsDialog.selected_replacements = lambda self: [
+    ("feedback", "обратная связь"),
+    ("meeting", "встреча"),
+    ("нет такого", "x"),
+]
+
+editor = window.pptx_editor
+report["opened"] = window.open_path(src)
+report["texts_before"] = editor.block_texts()
+report["current_text_before"] = editor.current_text()
+
+# Ветка применения: _on_rusify_ready направляет замены в PPTX-редактор.
+window._rusify_target = "pptx"
+window._on_rusify_ready(
+    "",
+    [
+        {"original": "feedback", "replacement": "обратная связь", "source": "dict"},
+        {"original": "meeting", "replacement": "встреча", "source": "llm"},
+    ],
+)
+report["texts_after_ready"] = editor.block_texts()
+report["status_after_ready"] = window.statusBar().currentMessage()
+report["modified_after_ready"] = editor.is_modified()
+
+report["saved"] = editor.save_file(dst)
+back = Presentation(dst)
+report["saved_texts"] = [
+    shape.text_frame.text for shape in back.slides[0].shapes if shape.has_text_frame
+]
+report["bold_after"] = [
+    bool(run.font.bold)
+    for paragraph in back.slides[0].shapes.title.text_frame.paragraphs
+    for run in paragraph.runs
+]
+
+# Ветка запуска: кнопка берёт текст слайда и блокирует правку на время работы.
+main_window.ReplacementsDialog.exec = (
+    lambda self: main_window.ReplacementsDialog.DialogCode.Rejected
+)
+window.russify_document()
+report["worker_started"] = window._worker is not None and window._worker.isRunning()
+report["worker_text"] = window._worker._text
+report["editors_locked"] = all(
+    block.isReadOnly() for block in editor.block_editors()
+)
+report["slide_list_locked"] = not editor.slide_list.isEnabled()
+window._worker.wait(20000)
+report["worker_progressed"] = window._worker.isFinished()
+
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+def _write_glossary_files(
+    directory: Path, glossary: dict[str, str], exceptions: list[str]
+) -> tuple[Path, Path]:
+    """Создать временные ``glossary.json`` и ``exceptions.json``.
+
+    Args:
+        directory: Каталог для файлов.
+        glossary: Пары «термин → замена».
+        exceptions: Токены исключений.
+
+    Returns:
+        tuple[Path, Path]: пути к глоссарию и исключениям.
+
+    Raises:
+        Ничего не бросает.
+    """
+    glossary_path = directory / "glossary.json"
+    exceptions_path = directory / "exceptions.json"
+    glossary_path.write_text(
+        json.dumps(glossary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    exceptions_path.write_text(
+        json.dumps(dict.fromkeys(exceptions), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return glossary_path, exceptions_path
+
+
+def _write_sample_pdf(path: Path) -> None:
+    """Создать двухстраничный PDF для тестов редактора.
+
+    Args:
+        path: Куда записать файл.
+
+    Returns:
+        None
+
+    Raises:
+        Ничего не бросает.
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfgen import canvas
+
+    pdf = canvas.Canvas(str(path), pagesize=A4)
+    pdf.setFont("Helvetica-Bold", 22)
+    pdf.drawString(60, 780, "Quarterly review")
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(60, 740, "Our product roadmap is ready")
+    pdf.drawString(60, 720, "The feedback from the meeting is below")
+    pdf.showPage()
+    pdf.setFont("Helvetica", 12)
+    pdf.drawString(60, 780, "Second page with deadline")
+    pdf.showPage()
+    pdf.save()
+
+
+#: Проверка загрузки PDF: страницы, рендер, блоки, битый файл.
+_SCRIPT_PDF_LOAD = (
+    _SCRIPT_PREAMBLE
+    + """
+from pathlib import Path
+
+import src.gui.main_window as main_window
+
+path = sys.argv[1]
+
+report["opened"] = window.open_path(path)
+report["active_tab"] = window.tabs.currentIndex()
+report["tab_title"] = window.tabs.tabText(window.tabs.currentIndex())
+
+editor = window.pdf_editor
+report["pages"] = editor.page_count()
+report["page_names"] = [
+    editor.page_list.item(index).text()
+    for index in range(editor.page_list.count())
+]
+report["current_page"] = editor.page_list.currentRow()
+report["page1_ids"] = editor.block_ids()
+report["page1_texts"] = editor.block_texts()
+report["total_blocks"] = editor.total_block_count()
+pixmap = editor.image_label.pixmap()
+report["render_null"] = pixmap.isNull()
+report["render_size"] = [pixmap.width(), pixmap.height()]
+report["raw_size"] = [
+    editor._page_pixmap.width(),
+    editor._page_pixmap.height(),
+] if editor._page_pixmap is not None else None
+report["modified_after_load"] = editor.is_modified()
+report["status_path"] = window.status_path.text()
+report["status_counts"] = window.status_counts.text()
+report["title"] = window.windowTitle()
+report["russify_label"] = window.action_russify.text()
+report["format_hidden"] = window.format_toolbar.isHidden()
+
+# Вторая страница: свой набор блоков.
+editor.select_page(1)
+report["page2_ids"] = editor.block_ids()
+report["page2_texts"] = editor.block_texts()
+report["status_after_page2"] = window.status_counts.text()
+
+# Правка не теряется при возврате на первую страницу.
+editor.select_page(0)
+editor.block_editors()[0].setPlainText("Updated title")
+report["modified_after_edit"] = editor.is_modified()
+editor.select_page(1)
+editor.select_page(0)
+report["text_after_switch"] = editor.block_texts()[0]
+
+# Пустой PDF (только графика) -- блоков нет, но страница рисуется.
+report["rendered_after_switch"] = not editor.image_label.pixmap().isNull()
+
+# Битый файл: ошибка в диалоге, открытый документ остаётся.
+import src.gui.pdf_editor as pdf_module
+
+errors = []
+pdf_module.QMessageBox.critical = lambda *args, **kwargs: errors.append(list(args[1:3]))
+broken = Path(path).with_name("broken.pdf")
+broken.write_bytes(b"%PDF-1.4 not really a pdf")
+report["broken_result"] = editor.load_file(str(broken))
+report["broken_error"] = bool(errors)
+report["pages_after_error"] = editor.page_count()
+report["text_kept_after_error"] = editor.block_texts()[0]
+
+editor.mark_saved()
+window.pdf_editor.close_document()
+window.editor.mark_saved()
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+#: Проверка сохранения PDF: правка блоков, кириллица, перезапись «на место».
+_SCRIPT_PDF_SAVE = (
+    _SCRIPT_PREAMBLE
+    + """
+import shutil
+from pathlib import Path
+
+import pymupdf
+
+src, dst, inplace = sys.argv[1], sys.argv[2], sys.argv[3]
+
+editor = window.pdf_editor
+report["opened"] = editor.load_file(src)
+editors = editor.block_editors()
+editors[0].setPlainText("Ежеквартальный обзор")
+editors[1].setPlainText("Наша дорожная карта готова")
+report["modified_before_save"] = editor.is_modified()
+
+report["saved"] = editor.save_file(dst)
+report["modified_after_save"] = editor.is_modified()
+report["current_path"] = editor.current_path.name
+report["texts_after_reload"] = editor.block_texts()
+report["total_after_reload"] = editor.total_block_count()
+
+doc = pymupdf.open(dst)
+report["out_pages"] = doc.page_count
+report["out_text"] = doc.load_page(0).get_text()
+report["out_fonts"] = sorted({font[3] for font in doc.load_page(0).get_fonts()})
+pix = doc.load_page(0).get_pixmap(matrix=pymupdf.Matrix(1, 1))
+report["out_render"] = [pix.width, pix.height]
+doc.close()
+
+# Перезапись «на место» исходного файла: результат идёт через временный файл.
+shutil.copyfile(src, inplace)
+report["inplace_opened"] = editor.load_file(inplace)
+editor.select_page(1)
+editor.block_editors()[0].setPlainText("Вторая страница обновлена")
+report["inplace_saved"] = editor.save_file(inplace)
+report["tmp_left"] = sorted(
+    path.name for path in Path(inplace).parent.glob(".*termru-tmp*")
+)
+doc = pymupdf.open(inplace)
+report["inplace_pages"] = doc.page_count
+report["inplace_page1"] = doc.load_page(0).get_text()
+report["inplace_page2"] = doc.load_page(1).get_text()
+report["inplace_size"] = Path(inplace).stat().st_size
+doc.close()
+
+editor.mark_saved()
+window.pdf_editor.close_document()
+window.editor.mark_saved()
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка русификации на вкладке PDF: маршрутизация замен и запуск воркера.
+_SCRIPT_PDF_RUSIFY = (
+    _SCRIPT_PREAMBLE
+    + """
+import pymupdf
+
+import src.gui.main_window as main_window
+
+src, dst = sys.argv[1], sys.argv[2]
+
+main_window.QMessageBox.information = lambda *args, **kwargs: None
+main_window.QMessageBox.question = lambda *args, **kwargs: None
+main_window.ReplacementsDialog.exec = (
+    lambda self: main_window.ReplacementsDialog.DialogCode.Accepted
+)
+main_window.ReplacementsDialog.selected_replacements = lambda self: [
+    ("feedback", "обратная связь"),
+    ("meeting", "встреча"),
+    ("нет такого", "x"),
+]
+
+editor = window.pdf_editor
+report["opened"] = window.open_path(src)
+report["texts_before"] = editor.block_texts()
+report["current_text"] = editor.current_text()
+
+# Ветка применения: _on_rusify_ready направляет замены в PDF-редактор.
+window._rusify_target = "pdf"
+window._on_rusify_ready(
+    "",
+    [
+        {"original": "feedback", "replacement": "обратная связь", "source": "dict"},
+        {"original": "meeting", "replacement": "встреча", "source": "llm"},
+    ],
+)
+report["texts_after_ready"] = editor.block_texts()
+report["status_after_ready"] = window.statusBar().currentMessage()
+report["modified_after_ready"] = editor.is_modified()
+
+report["saved"] = editor.save_file(dst)
+doc = pymupdf.open(dst)
+report["saved_text"] = doc.load_page(0).get_text()
+doc.close()
+
+# Ветка запуска: кнопка берёт текст страницы и блокирует правку.
+main_window.ReplacementsDialog.exec = (
+    lambda self: main_window.ReplacementsDialog.DialogCode.Rejected
+)
+window.russify_document()
+report["worker_started"] = window._worker is not None and window._worker.isRunning()
+report["worker_text"] = window._worker._text
+report["editors_locked"] = all(
+    block.isReadOnly() for block in editor.block_editors()
+)
+report["page_list_locked"] = not editor.page_list.isEnabled()
+window._worker.wait(20000)
+report["worker_finished"] = window._worker.isFinished()
+
+editor.mark_saved()
+window.pdf_editor.close_document()
+window.editor.mark_saved()
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+#: Проверка предупреждения о повторной обработке уже сконвертированного PDF.
+_SCRIPT_PDF_REPROCESS = (
+    _SCRIPT_PREAMBLE
+    + """
+from pathlib import Path
+
+import src.gui.pdf_editor as pdf_module
+
+src, dst = sys.argv[1], sys.argv[2]
+
+editor = window.pdf_editor
+report["opened"] = editor.load_file(src)
+report["already_processed"] = editor._already_processed()
+editor.block_editors()[0].setPlainText("Повторная правка")
+
+answers = []
+
+
+def _deny(*args, **kwargs):
+    answers.append(list(args[1:3]))
+    return pdf_module.QMessageBox.StandardButton.No
+
+
+pdf_module.QMessageBox.warning = _deny
+report["saved_no"] = editor.save_file(dst)
+report["file_created_no"] = Path(dst).exists()
+report["warning_shown"] = bool(answers)
+report["warning_title"] = answers[0][0] if answers else None
+report["still_modified"] = editor.is_modified()
+
+pdf_module.QMessageBox.warning = (
+    lambda *args, **kwargs: pdf_module.QMessageBox.StandardButton.Yes
+)
+report["saved_yes"] = editor.save_file(dst)
+report["file_created_yes"] = Path(dst).exists()
+
+editor.mark_saved()
+window.pdf_editor.close_document()
+window.editor.mark_saved()
+window.pptx_editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+#: Проверка редактора словаря: загрузка, добавление слов, запись в JSON.
+_SCRIPT_GLOSSARY_EDITOR = (
+    _SCRIPT_PREAMBLE
+    + """
+import json
+from pathlib import Path
+
+from src.glossary_manager import GlossaryManager
+from src.gui.glossary_editor import GlossaryEditorDialog
+import src.gui.glossary_editor as editor_module
+from src.replacement_engine import ReplacementEngine
+
+glossary_path, exceptions_path = sys.argv[1], sys.argv[2]
+
+manager = GlossaryManager(glossary_path, exceptions_path)
+dialog = GlossaryEditorDialog(manager)
+
+report["tabs"] = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
+report["glossary_headers"] = [
+    dialog.glossary_table.horizontalHeaderItem(i).text()
+    for i in range(dialog.glossary_table.columnCount())
+]
+report["exception_headers"] = [
+    dialog.exceptions_table.horizontalHeaderItem(i).text()
+    for i in range(dialog.exceptions_table.columnCount())
+]
+report["glossary_rows"] = dialog.glossary_table.rowCount()
+report["glossary_cells"] = [
+    dialog.glossary_table.item(0, 0).text(),
+    dialog.glossary_table.item(0, 1).text(),
+]
+report["exception_rows"] = dialog.exceptions_table.rowCount()
+report["counts_label"] = dialog.counts.text()
+
+# Добавляем термин и исключение, затем сохраняем.
+row = dialog.add_row(dialog.glossary_table)
+dialog.glossary_table.item(row, 0).setText("invoice")
+dialog.glossary_table.item(row, 1).setText("счёт")
+ex_row = dialog.add_row(dialog.exceptions_table)
+dialog.exceptions_table.item(ex_row, 0).setText("SKU")
+
+warnings = []
+editor_module.QMessageBox.warning = lambda *args, **kwargs: warnings.append(
+    list(args[1:3])
+)
+report["saved"] = dialog.save()
+report["dialog_result"] = dialog.result()
+report["file_glossary"] = json.loads(Path(glossary_path).read_text(encoding="utf-8"))
+report["file_exceptions"] = json.loads(Path(exceptions_path).read_text(encoding="utf-8"))
+report["tmp_left"] = sorted(
+    path.name for path in Path(glossary_path).parent.glob("*termru-tmp*")
+)
+
+# Новые слова сразу видны движку замены (reload внутри save).
+report["hit"] = dict(manager.get_replacements("the invoice is ready"))
+report["engine_text"] = ReplacementEngine(manager).replace_dict_only(
+    "Our invoice is ready"
+)[0]
+report["exception_hit"] = manager.is_exception("sku")
+
+# Дубликат (регистр не важен) сохранять нельзя: файл остаётся прежним.
+row = dialog.add_row(dialog.glossary_table)
+dialog.glossary_table.item(row, 0).setText("Invoice")
+dialog.glossary_table.item(row, 1).setText("счёт-фактура")
+report["duplicate_saved"] = dialog.save()
+report["duplicate_warning"] = warnings[0][1] if warnings else None
+report["file_after_duplicate"] = json.loads(
+    Path(glossary_path).read_text(encoding="utf-8")
+)
+
+# Удаление строки работает на выбранной таблице.
+before = dialog.glossary_table.rowCount()
+dialog.glossary_table.setCurrentCell(before - 1, 0)
+report["removed"] = dialog.remove_selected_rows(dialog.glossary_table)
+report["rows_after_remove"] = dialog.glossary_table.rowCount()
+
+dialog.close()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+#: Проверка настроек: вкладки, переключение темы и режим PDF.
+_SCRIPT_SETTINGS_THEME = (
+    _SCRIPT_PREAMBLE
+    + """
+from pathlib import Path
+
+from PySide6.QtCore import QSettings
+
+settings_dir = sys.argv[1]
+# Изолируем QSettings от реального профиля пользователя. Важно: экземпляры
+# QSettings(org, app) используют NativeFormat, поэтому подменять нужно его.
+QSettings.setPath(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, settings_dir)
+
+from src.gui.settings import SettingsDialog, load_settings, stylesheet_for
+
+report["defaults"] = load_settings()
+
+dialog = SettingsDialog(
+    initial={"api_key": "", "use_llm": False, "theme": "dark", "pdf_fonts": "always"}
+)
+report["tabs"] = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
+report["theme_items"] = [
+    dialog.theme_combo.itemData(i) for i in range(dialog.theme_combo.count())
+]
+report["pdf_items"] = [
+    dialog.pdf_combo.itemData(i) for i in range(dialog.pdf_combo.count())
+]
+
+# Переключение темы применяется к QApplication сразу.
+dialog.theme_combo.setCurrentIndex(dialog.theme_combo.findData("light"))
+report["theme_after_switch"] = dialog.theme()
+report["style_matches_light"] = app.styleSheet() == stylesheet_for("light")
+
+dialog.pdf_combo.setCurrentIndex(dialog.pdf_combo.findData("strict"))
+report["pdf_mode"] = dialog.pdf_font_mode()
+
+dialog.save_and_close()
+report["dialog_result"] = dialog.result()
+report["saved"] = load_settings()
+settings_file = Path(settings_dir) / "TermRu" / "Editor.conf"
+report["settings_file"] = str(settings_file)
+report["settings_written"] = settings_file.exists()
+report["settings_text"] = (
+    settings_file.read_text(encoding="utf-8") if settings_file.exists() else ""
+)
+
+# Отмена возвращает прежнюю тему.
+dialog2 = SettingsDialog(
+    initial={"api_key": "", "use_llm": False, "theme": "light", "pdf_fonts": "strict"}
+)
+dialog2.theme_combo.setCurrentIndex(dialog2.theme_combo.findData("dark"))
+report["theme_switched_again"] = app.styleSheet() == stylesheet_for("dark")
+dialog2.reject()
+report["theme_after_reject"] = app.styleSheet() == stylesheet_for("light")
+
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка, что отредактированный словарь сразу работает в русификации.
+_SCRIPT_GLOSSARY_RUSSIFY = (
+    _SCRIPT_PREAMBLE
+    + """
+import src.gui.main_window as main_window
+from src.glossary_manager import GlossaryManager
+
+main_window.QMessageBox.information = lambda *args, **kwargs: None
+main_window.ReplacementsDialog.exec = (
+    lambda self: main_window.ReplacementsDialog.DialogCode.Rejected
+)
+
+window.glossary = GlossaryManager(sys.argv[1], sys.argv[2])
+window.editor.setPlainText("Our gadget is ready")
+report["text_before"] = window.editor.toPlainText()
+
+window.russify_document()
+report["worker_started"] = window._worker is not None
+report["worker_uses_manager"] = window._worker._glossary is window.glossary
+report["worker_text"] = window._worker._text
+window._worker.result_ready.connect(
+    lambda text, changes: report.setdefault("result", [text, len(changes)])
+)
+window._worker.wait(20000)
+for _ in range(20):
+    app.processEvents()
+
+report["text_after"] = report.get("result", [None])[0]
+
+window.editor.mark_saved()
+window.pptx_editor.mark_saved()
+window.pdf_editor.close_document()
 window.close()
 print(json.dumps(report, ensure_ascii=False))
 """
@@ -328,13 +1131,26 @@ def _run_gui_script(script: str, *args: str) -> dict:
 
 
 def test_main_window_builds_ui() -> None:
-    """Окно содержит меню, панель инструментов, редактор и статус-бар."""
+    """Окно содержит вкладки, меню, панель инструментов и статус-бар."""
     report = _run_gui_script(_SCRIPT_UI)
 
-    assert report["central_is_editor"] is True
+    assert report["central_is_tabs"] is True
+    assert report["tab_titles"] == [
+        "Word (DOCX)",
+        "PowerPoint (PPTX)",
+        "PDF",
+    ], report["tab_titles"]
+    assert report["word_editor_in_tab0"] is True
+    assert report["pptx_editor_in_tab1"] is True
+    assert report["pdf_editor_in_tab2"] is True
     assert len(report["menus"]) == 4, report["menus"]
     assert report["toolbar_actions"] >= 3
     assert report["toolbar_count"] == 2
+    assert report["tools_menu"] == [
+        "Редактор словаря…",
+        "Настройки…",
+        "Русифицировать документ",
+    ], report["tools_menu"]
     assert report["status_path"] == "Новый документ"
     assert report["status_counts"] == "Слов: 0 · Символов: 0"
     assert report["title"].startswith("TermRu — Редактор документов")
@@ -412,7 +1228,7 @@ def test_rusify_worker_emits_signals() -> None:
     report = _run_gui_script(_SCRIPT_WORKER)
 
     assert report["error"] is None, report["error"]
-    assert report["progress"] == [10, 100], report["progress"]
+    assert report["progress"] == [10, 40, 100], report["progress"]
     assert report["result"] is not None
     new_text, changes = report["result"]
     assert new_text == "the обратная связь is clear"
@@ -420,18 +1236,467 @@ def test_rusify_worker_emits_signals() -> None:
     assert report["thread_finished"] is True
 
 
+def test_rusify_worker_with_mock_llm() -> None:
+    """С use_llm воркер добавляет diff-пары от ИИ к словарным."""
+    report = _run_gui_script(_SCRIPT_WORKER_LLM)
+
+    assert report["error"] is None, report["error"]
+    assert report["result"] is not None
+    new_text, changes = report["result"]
+    assert "отчёт готов" in new_text
+
+    sources = {item["source"] for item in changes}
+    assert "dict" in sources and "llm" in sources, sources
+
+    llm_pairs = [
+        (item["original"], item["replacement"]) for item in changes if item["source"] == "llm"
+    ]
+    assert ("report is ready", "отчёт готов") in llm_pairs, llm_pairs
+
+    assert report["calls"], "LLM не вызывалась"
+    assert report["calls"][0]["key"] == "test-key"
+
+
+def test_rusify_worker_reports_api_error() -> None:
+    """Ошибка API превращается в сигнал failed с понятным текстом."""
+    report = _run_gui_script(_SCRIPT_WORKER_LLM_ERROR)
+
+    assert report["error"] is not None, "ошибка не передана"
+    assert "Ошибка API" in report["error"], report["error"]
+
+
 def test_replacements_dialog_and_apply() -> None:
     """Диалог показывает замены, галочки снимаются, текст применяется."""
     report = _run_gui_script(_SCRIPT_PREVIEW)
 
     assert report["rows"] == 2
-    assert report["headers"] == ["Оригинал", "Замена", "Применить"]
+    assert report["headers"] == ["Оригинал", "Замена", "Источник", "Применить"]
+    assert report["sources"] == ["Словарь", "ИИ"], report["sources"]
     assert report["selected_before"] == ["feedback", "meeting"]
     assert report["selected_after"] == ["feedback"], "снятая галочка не учтена"
 
     assert report["applied"] == 2
     assert report["text_after"] == "the обратная связь and встреча are here"
     assert report["bold_kept"] is True, "замена потеряла жирное начертание"
+
+
+def test_pptx_editor_load(tmp_path: Path) -> None:
+    """PPTX открывается: список слайдов, блоки, пустой слайд, битый файл."""
+    path = tmp_path / "deck.pptx"
+    report = _run_gui_script(_SCRIPT_PPTX_LOAD, str(path))
+
+    assert report["opened"] is True
+    assert report["active_tab"] == 1, "вкладка не переключилась на PPTX"
+    assert report["tab_title"] == "PowerPoint (PPTX)"
+
+    assert report["slide_count"] == 3, report["slide_names"]
+    assert report["slide_names"] == [
+        "Слайд 1: Quarterly feedback",
+        "Слайд 2",
+        "Слайд 3",
+    ], report["slide_names"]
+
+    assert report["blocks_slide0"] == 2
+    assert report["captions_slide0"][0].startswith("Заголовок")
+    assert report["captions_slide0"][1].startswith("Содержимое")
+    assert report["texts_slide0"] == ["Quarterly feedback", "first line\nsecond line"]
+    assert report["modified_after_load"] is False
+
+    assert report["status_path"] == str(path)
+    assert report["status_counts"] == "Слайдов: 3 · Блоков: 2", report["status_counts"]
+    assert report["title"] == f"TermRu — Редактор документов — deck.pptx[*]"
+    assert report["russify_label"] == "Русифицировать слайд"
+    assert report["format_hidden"] is True, "панель форматирования DOCX осталась видна"
+
+    assert report["table_blocks"] == 2, "ячейки таблицы не попали в редактор"
+    assert report["table_texts"] == ["TLS handshake", "milestone owner"]
+    assert "R1C1" in report["table_captions"][0], report["table_captions"]
+    assert "R1C2" in report["table_captions"][1], report["table_captions"]
+
+    assert report["blank_blocks"] == 0
+    assert report["blank_hint"] == "Нет текстовых блоков", report["blank_hint"]
+
+    assert report["empty_message"], "нет сообщения о пустом слайде"
+    assert report["empty_message"][0][1] == "На слайде нет текста."
+    assert report["worker_after_empty"] is False, "воркер запустился для пустого слайда"
+
+    assert report["modified_after_edit"] is True
+    assert report["text_after_switch"] == "Черновик заголовка", "правка потерялась"
+
+    assert report["broken_result"] is False
+    assert report["broken_error"] is True, "ошибка открытия не показана"
+    assert report["slides_after_error"] == 3, "битый файл сбросил открытую презентацию"
+    assert report["text_kept_after_error"] == "Черновик заголовка"
+
+
+def test_pptx_editor_save(tmp_path: Path) -> None:
+    """Изменённый текст QTextEdit сохраняется в PPTX без потери жирного."""
+    source = tmp_path / "in.pptx"
+    target = tmp_path / "out.pptx"
+
+    report = _run_gui_script(_SCRIPT_PPTX_SAVE, str(source), str(target))
+
+    assert report["opened"] is True
+    assert report["blocks_before"] == ["Quarterly feedback", "first line\nsecond line"]
+    assert report["modified_before_save"] is True
+
+    assert report["saved"] is True
+    assert target.is_file()
+    assert report["modified_after_save"] is False
+    assert report["current_path"] == "out.pptx"
+
+    assert report["saved_slides"] == 1
+    assert report["saved_texts"] == [
+        "Ежеквартальный отчёт",
+        "строка один\nстрока два",
+    ], report["saved_texts"]
+    assert report["saved_title_runs"] == [["Ежеквартальный отчёт", True]]
+
+
+def test_pptx_rusify_flow(tmp_path: Path) -> None:
+    """Русификация на вкладке PPTX правит слайд и запускает воркер."""
+    source = tmp_path / "in.pptx"
+    target = tmp_path / "out.pptx"
+
+    report = _run_gui_script(_SCRIPT_PPTX_RUSIFY, str(source), str(target))
+
+    assert report["opened"] is True
+    assert report["current_text_before"] == "Product feedback\n\nmeeting notes"
+
+    assert report["texts_after_ready"] == ["Product обратная связь", "встреча notes"]
+    assert report["status_after_ready"] == "Применено замен: 2"
+    assert report["modified_after_ready"] is True
+
+    assert report["saved"] is True
+    assert report["saved_texts"] == ["Product обратная связь", "встреча notes"]
+    assert report["bold_after"] == [True], "замена потеряла жирное начертание"
+
+    assert report["worker_started"] is True, "воркер не запустился"
+    assert report["worker_text"] == "Product обратная связь\n\nвстреча notes"
+    assert report["editors_locked"] is True, "правка не заблокирована на время работы"
+    assert report["slide_list_locked"] is True, "список слайдов не заблокирован"
+    assert report["worker_progressed"] is True
+
+
+def test_pdf_editor_load(tmp_path: Path) -> None:
+    """PDF открывается: страницы, рендер, блоки по страницам, битый файл."""
+    path = tmp_path / "report.pdf"
+    _write_sample_pdf(path)
+
+    report = _run_gui_script(_SCRIPT_PDF_LOAD, str(path))
+
+    assert report["opened"] is True
+    assert report["active_tab"] == 2, "вкладка не переключилась на PDF"
+    assert report["tab_title"] == "PDF"
+
+    assert report["pages"] == 2
+    assert report["page_names"] == ["Страница 1", "Страница 2"], report["page_names"]
+    assert report["current_page"] == 0
+
+    assert report["page1_ids"] == [0, 1, 2], report["page1_ids"]
+    assert report["page1_texts"] == [
+        "Quarterly review",
+        "Our product roadmap is ready",
+        "The feedback from the meeting is below",
+    ], report["page1_texts"]
+    assert report["total_blocks"] == 4
+
+    assert report["render_null"] is False, "страница не отрисовалась"
+    # A4 при zoom=1.5 — это ~893x1263 точек, то есть рендер именно 1.5x.
+    assert report["raw_size"] is not None
+    assert report["raw_size"][0] > 800 and report["raw_size"][1] > 1100, report["raw_size"]
+
+    assert report["modified_after_load"] is False
+    assert report["status_path"] == str(path)
+    assert report["status_counts"] == "Страниц: 2 · Блоков: 3", report["status_counts"]
+    assert report["title"] == "TermRu — Редактор документов — report.pdf[*]"
+    assert report["russify_label"] == "Русифицировать страницу"
+    assert report["format_hidden"] is True, "панель форматирования DOCX осталась видна"
+
+    assert report["page2_ids"] == [3], report["page2_ids"]
+    assert report["page2_texts"] == ["Second page with deadline"]
+    assert report["status_after_page2"] == "Страниц: 2 · Блоков: 1"
+
+    assert report["modified_after_edit"] is True
+    assert report["text_after_switch"] == "Updated title", "правка потерялась"
+    assert report["rendered_after_switch"] is True
+
+    assert report["broken_result"] is False
+    assert report["broken_error"] is True, "ошибка открытия не показана"
+    assert report["pages_after_error"] == 2, "битый файл сбросил открытый документ"
+    assert report["text_kept_after_error"] == "Updated title"
+
+
+def test_pdf_editor_save(tmp_path: Path) -> None:
+    """Правка блоков записывается в PDF, кириллица кодируется, «на место» тоже."""
+    source = tmp_path / "in.pdf"
+    target = tmp_path / "out.pdf"
+    inplace = tmp_path / "inplace.pdf"
+    _write_sample_pdf(source)
+
+    report = _run_gui_script(
+        _SCRIPT_PDF_SAVE, str(source), str(target), str(inplace)
+    )
+
+    assert report["opened"] is True
+    assert report["modified_before_save"] is True
+    assert report["saved"] is True, "PDF не записался"
+    assert target.is_file()
+    assert report["modified_after_save"] is False
+    assert report["current_path"] == "out.pdf"
+
+    # Файл перечитан после записи: блоки соответствуют новой вёрстке.
+    assert report["total_after_reload"] >= 4
+
+    assert report["out_pages"] == 2, "потерялись страницы"
+    assert "Ежеквартальный" in report["out_text"], report["out_text"]
+    assert "обзор" in report["out_text"]
+    assert "Наша дорожная карта готова" in report["out_text"].replace("\n", " ")
+    assert report["out_render"][0] > 500, "страница результата не рендерится"
+    # base-14 Helvetica не умеет кириллицу — движок подставил свой CID-шрифт.
+    assert any(
+        name not in {"Helvetica", "Helvetica-Bold"} for name in report["out_fonts"]
+    ), report["out_fonts"]
+
+    # Перезапись «на место» идёт через временный файл и не оставляет мусора.
+    assert report["inplace_opened"] is True
+    assert report["inplace_saved"] is True
+    assert report["tmp_left"] == [], report["tmp_left"]
+    assert report["inplace_pages"] == 2
+    assert "Quarterly review" in report["inplace_page1"], report["inplace_page1"]
+    assert "Вторая страница обновлена" in report["inplace_page2"].replace("\n", " ")
+    assert report["inplace_size"] > 1000
+
+
+def test_pdf_rusify_flow(tmp_path: Path) -> None:
+    """Русификация на вкладке PDF правит блоки страницы и запускает воркер."""
+    source = tmp_path / "in.pdf"
+    target = tmp_path / "out.pdf"
+    _write_sample_pdf(source)
+
+    report = _run_gui_script(_SCRIPT_PDF_RUSIFY, str(source), str(target))
+
+    assert report["opened"] is True
+    assert report["current_text"] == (
+        "Quarterly review\n\nOur product roadmap is ready\n\n"
+        "The feedback from the meeting is below"
+    ), report["current_text"]
+
+    assert report["texts_after_ready"][2] == "The обратная связь from the встреча is below"
+    assert report["status_after_ready"] == "Применено замен: 2"
+    assert report["modified_after_ready"] is True
+
+    assert report["saved"] is True
+    assert "обратная связь" in report["saved_text"], report["saved_text"]
+    assert "встреча" in report["saved_text"]
+
+    assert report["worker_started"] is True, "воркер не запустился"
+    assert "обратная связь" in report["worker_text"]
+    assert report["editors_locked"] is True, "правка не заблокирована на время работы"
+    assert report["page_list_locked"] is True, "список страниц не заблокирован"
+    assert report["worker_finished"] is True
+
+
+def test_pdf_editor_warns_before_reprocessing(tmp_path: Path) -> None:
+    """Повторная запись уже обработанного PDF требует подтверждения."""
+    from src.document_processor import DocumentProcessor
+
+    original = tmp_path / "in.pdf"
+    processed = tmp_path / "processed.pdf"
+    target = tmp_path / "again.pdf"
+    _write_sample_pdf(original)
+
+    processor = DocumentProcessor(pdf_substitute_fonts="always")
+    blocks = processor.extract_text(str(original))
+    result = processor.apply_replacements(
+        str(original), {blocks[0]["block_id"]: "Ежеквартальный обзор"}, str(processed)
+    )
+    assert result["success"] is True
+
+    report = _run_gui_script(_SCRIPT_PDF_REPROCESS, str(processed), str(target))
+
+    assert report["opened"] is True
+    assert report["already_processed"] is True, "файл не распознан как обработанный"
+    assert report["saved_no"] is False, "запись прошла без подтверждения"
+    assert report["file_created_no"] is False
+    assert report["still_modified"] is True, "правки потерялись при отказе"
+    assert report["warning_shown"] is True
+    assert report["warning_title"] == "PDF уже обработан"
+
+    assert report["saved_yes"] is True
+    assert report["file_created_yes"] is True
+
+
+def test_glossary_editor_load_and_save(tmp_path: Path) -> None:
+    """Диалог словаря читает JSON, добавляет слова, пишет файлы и делает reload."""
+    glossary_path, exceptions_path = _write_glossary_files(
+        tmp_path, {"feedback": "обратная связь"}, ["API"]
+    )
+    report = _run_gui_script(
+        _SCRIPT_GLOSSARY_EDITOR, str(glossary_path), str(exceptions_path)
+    )
+
+    assert report["tabs"] == ["Словарь", "Исключения"]
+    assert report["glossary_headers"] == ["Английский", "Русский"]
+    assert report["exception_headers"] == ["Слово / Аббревиатура"]
+    assert report["glossary_rows"] == 1
+    assert report["glossary_cells"] == ["feedback", "обратная связь"]
+    assert report["exception_rows"] == 1
+    assert report["counts_label"] == "Терминов: 1 · исключений: 1"
+
+    assert report["saved"] is True
+    assert report["dialog_result"] == 1, "диалог не закрылся с Accepted"
+    assert report["file_glossary"] == {
+        "feedback": "обратная связь",
+        "invoice": "счёт",
+    }, report["file_glossary"]
+    assert report["file_exceptions"] == {"API": None, "SKU": None}
+    assert report["tmp_left"] == [], report["tmp_left"]
+
+    # Новое слово сразу работает: менеджер перечитан внутри save().
+    assert report["hit"] == {"invoice": "счёт"}
+    assert report["engine_text"] == "Our счёт is ready"
+    assert report["exception_hit"] is True
+
+    # Дубликат (регистр не важен) не пишется в файл.
+    assert report["duplicate_saved"] is False
+    assert "повторяется" in (report["duplicate_warning"] or "")
+    assert "Invoice" not in report["file_after_duplicate"]
+
+    assert report["removed"] == 1
+    assert report["rows_after_remove"] == 2
+
+
+def test_settings_theme_change(tmp_path: Path) -> None:
+    """Тема переключается и сохраняется в QSettings, режим PDF тоже."""
+    report = _run_gui_script(_SCRIPT_SETTINGS_THEME, str(tmp_path))
+
+    assert report["tabs"] == ["DeepSeek", "Внешний вид", "PDF"]
+    assert report["theme_items"] == ["dark", "light"]
+    assert report["pdf_items"] == ["strict", "base14", "always"]
+    assert report["defaults"]["theme"] == "dark"
+    assert report["defaults"]["pdf_fonts"] == "always"
+
+    assert report["theme_after_switch"] == "light"
+    assert report["style_matches_light"] is True, "светлая тема не применилась сразу"
+
+    assert report["pdf_mode"] == "strict"
+    assert report["dialog_result"] == 1
+
+    assert report["saved"]["theme"] == "light"
+    assert report["saved"]["pdf_fonts"] == "strict"
+    assert report["settings_written"] is True
+    assert str(tmp_path) in report["settings_file"]
+    settings_text = report["settings_text"].replace(" ", "")
+    assert "theme=light" in settings_text, settings_text
+    assert "substitute_fonts=strict" in settings_text, settings_text
+
+    # Отмена возвращает тему, которая была до открытия диалога.
+    assert report["theme_switched_again"] is True
+    assert report["theme_after_reject"] is True
+
+
+def test_russify_uses_edited_glossary(tmp_path: Path) -> None:
+    """Термин из отредактированного словаря срабатывает в русификации сразу."""
+    glossary_path, exceptions_path = _write_glossary_files(
+        tmp_path, {"gadget": "устройство"}, ["API"]
+    )
+    report = _run_gui_script(
+        _SCRIPT_GLOSSARY_RUSSIFY, str(glossary_path), str(exceptions_path)
+    )
+
+    assert report["text_before"] == "Our gadget is ready"
+    assert report["worker_started"] is True
+    assert report["worker_uses_manager"] is True, "воркер не получил словарь окна"
+    assert report["worker_text"] == "Our gadget is ready"
+    assert report["text_after"] == "Our устройство is ready", report["text_after"]
+
+
+def _project_root() -> Path:
+    """Корень проекта.
+
+    Returns:
+        Path: каталог, где лежат ``unifypy.json`` и точки входа.
+
+    Raises:
+        Ничего не бросает.
+    """
+    return Path(__file__).resolve().parents[1]
+
+
+def test_gui_entry_module_imports() -> None:
+    """``termru_gui_entry.py`` импортируется и выбирает режим по аргументам."""
+    root = _project_root()
+    assert (root / "termru_gui_entry.py").is_file(), "нет termru_gui_entry.py"
+    assert (root / "termru_cli_entry.py").is_file(), "нет termru_cli_entry.py (CLI)"
+    assert not (root / "termru_entry.py").exists(), "осталась старая точка входа"
+
+    script = """
+import json
+
+import termru_gui_entry as entry
+
+print(json.dumps({
+    "no_args": entry.use_cli_mode([]),
+    "with_input": entry.use_cli_mode(["--input", "x.docx"]),
+    "version": entry.use_cli_mode(["--version"]),
+    "gui_flag": entry.use_cli_mode([entry.GUI_FLAG]),
+    "smoke_flag": entry.use_cli_mode([entry.GUI_SMOKE_FLAG]),
+    "main_callable": callable(entry.main),
+}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        cwd=str(root),
+    )
+
+    assert completed.returncode == 0, completed.stderr[-3000:]
+    report = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert report["no_args"] is False, "без аргументов должен стартовать GUI"
+    assert report["with_input"] is True, "аргументы должны включать CLI"
+    assert report["version"] is True
+    assert report["gui_flag"] is False
+    assert report["smoke_flag"] is False
+    assert report["main_callable"] is True
+
+
+def test_unifypy_config_builds_gui() -> None:
+    """``unifypy.json`` собирает GUI-версию и не тянет тяжёлые модули Qt."""
+    config = json.loads(
+        (_project_root() / "unifypy.json").read_text(encoding="utf-8")
+    )
+
+    assert config["entry"] == "termru_gui_entry.py"
+    assert config["name"] == "TermRu", "имя приложения влияет на имя бинарника"
+    assert config.get("package") == "termru", "имя deb-пакета должно быть в нижнем регистре"
+
+    pyinstaller = config["pyinstaller"]
+    hidden = set(pyinstaller["hidden_import"])
+    assert {"PySide6.QtSvg", "PySide6.QtPrintSupport"} <= hidden, hidden
+    assert "qdarkstyle" in hidden, "стили темы иначе не попадут в бандл"
+
+    excludes = set(pyinstaller["exclude_module"])
+    for module in (
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtMultimedia",
+        "PySide6.Qt3DCore",
+        "PySide6.QtCharts",
+        "PySide6.QtDataVisualization",
+        "PySide6.QtQuick",
+        "PySide6.QtQml",
+    ):
+        assert module in excludes, f"{module} не исключён — бандл раздуется"
+    # PDF-редактор рендерит страницы через pypdfium2 (~8 МБ), а тяжёлый
+    # PyMuPDF (~50 МБ) в бандл не попадает.
+    assert "pymupdf" in excludes
+    assert "fitz" in excludes
+    assert "pypdfium2" not in excludes
+    assert "pypdfium2_raw" not in excludes
 
 
 def test_gui_entrypoint_imports() -> None:

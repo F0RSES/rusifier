@@ -24,7 +24,12 @@ from reportlab.pdfgen import canvas
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 #: Где может лежать собранный бинарник (onedir, onefile, установленный deb).
+#: Первое имя — текущее (``name: TermRu`` в unifypy.json), остальные — старые
+#: сборки CLI-версии, чтобы тесты не пропускались на устаревших артефактах.
 _BINARY_CANDIDATES = (
+    PROJECT_ROOT / "dist" / "TermRu" / "TermRu",
+    PROJECT_ROOT / "dist" / "TermRu",
+    Path("/opt/termru/TermRu"),
     PROJECT_ROOT / "dist" / "termru" / "termru",
     PROJECT_ROOT / "dist" / "termru",
     Path("/opt/termru/termru"),
@@ -196,12 +201,17 @@ def test_deb_formats_registered(packaged_binary: Path) -> None:
 
 
 def test_binary_size_budget(packaged_binary: Path) -> None:
-    """Бандл не раздулся обратно: страховка от регрессии ``exclude_module``."""
+    """Бандл не раздулся обратно: страховка от регрессии ``exclude_module``.
+
+    GUI-сборка с Qt весит около 320 МиБ распакованной (Qt + ICU + pypdfium2 +
+    python-документные зависимости). Предел 400 МиБ ловит возврат тяжёлых
+    модулей: Qt WebEngine добавляет ~150 МиБ, PyMuPDF — ~50 МиБ.
+    """
     binary_bytes = packaged_binary.stat().st_size
     internal = packaged_binary.parent / "_internal"
     total = binary_bytes
     if internal.is_dir():
         total += sum(item.stat().st_size for item in internal.rglob("*") if item.is_file())
-    assert total < 160 * 1024 * 1024, (
-        f"бандл {total / 1024 / 1024:.0f} МБ — excludes не применились"
+    assert total < 400 * 1024 * 1024, (
+        f"бандл {total / 1024 / 1024:.0f} МиБ — excludes не применились"
     )

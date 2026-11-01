@@ -1,4 +1,9 @@
-"""Главное окно TermRu: меню, панель инструментов, редактор, статус-бар."""
+"""Главное окно TermRu: меню, вкладки, панели инструментов, статус-бар.
+
+Центральный виджет — ``QTabWidget``: вкладка Word (DOCX) и вкладка
+PowerPoint (PPTX). Меню и панели подстраиваются под активную вкладку.
+"""
+
 
 from __future__ import annotations
 
@@ -16,6 +21,7 @@ from PySide6.QtGui import (
     QTextListFormat,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QFileDialog,
     QInputDialog,
     QLabel,
@@ -23,16 +29,51 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QStyle,
+    QTabWidget,
+    QTextEdit,
     QToolBar,
     QWidget,
 )
 
+from ..glossary_manager import GlossaryError, GlossaryManager
 from .docx_editor import DocxEditor
-from .rusify import ReplacementsDialog, RusifyWorker
+from .glossary_editor import GlossaryEditorDialog
+from .pdf_editor import TAB_TITLE as PDF_TAB_TITLE
+from .pdf_editor import PdfEditor
+from .pptx_editor import TAB_TITLE as PPTX_TAB_TITLE
+from .pptx_editor import PptxEditor
+from .rusify import (
+    DEFAULT_EXCEPTIONS,
+    DEFAULT_GLOSSARY,
+    ReplacementsDialog,
+    RusifyWorker,
+)
+from .settings import SettingsDialog, apply_theme, load_settings
 
 APP_TITLE = "TermRu — Редактор документов"
 DOCX_FILTER = "Документы Word (*.docx)"
+PPTX_FILTER = "Презентации PowerPoint (*.pptx)"
+PDF_FILTER = "Документы PDF (*.pdf)"
+ANY_FILTER = "Документы TermRu (*.docx *.pptx *.pdf)"
 NEW_DOCUMENT = "Новый документ"
+NEW_PRESENTATION = "Новая презентация"
+NEW_PDF = "PDF не открыт"
+WORD_TAB_TITLE = "Word (DOCX)"
+WORD_TAB_INDEX = 0
+PPTX_TAB_INDEX = 1
+PDF_TAB_INDEX = 2
+
+#: Подписи действия «Русифицировать» для каждой вкладки.
+RUSSIFY_WORD_LABEL = "Русифицировать документ"
+RUSSIFY_PPTX_LABEL = "Русифицировать слайд"
+RUSSIFY_PDF_LABEL = "Русифицировать страницу"
+
+#: Тип вкладки → подпись действия русификации.
+RUSSIFY_LABELS = {
+    "word": RUSSIFY_WORD_LABEL,
+    "pptx": RUSSIFY_PPTX_LABEL,
+    "pdf": RUSSIFY_PDF_LABEL,
+}
 
 
 class MainWindow(QMainWindow):
@@ -60,7 +101,25 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.resize(1100, 760)
         self.editor = DocxEditor(self)
-        self.setCentralWidget(self.editor)
+        self.pptx_editor = PptxEditor(self)
+        state = load_settings()
+        self.pdf_editor = PdfEditor(self, font_mode=state["pdf_fonts"])
+        #: Проектный словарь; ``None`` — файлы недоступны (см. ``_glossary_error``).
+        self.glossary: GlossaryManager | None = None
+        self._glossary_error = ""
+        try:
+            self.glossary = GlossaryManager(
+                str(DEFAULT_GLOSSARY), str(DEFAULT_EXCEPTIONS)
+            )
+        except (GlossaryError, OSError) as exc:  # noqa: BLE001 - окно без словаря работает
+            self._glossary_error = str(exc)
+
+        self.tabs = QTabWidget(self)
+        self.tabs.setObjectName("documentTabs")
+        self.tabs.addTab(self.editor, WORD_TAB_TITLE)
+        self.tabs.addTab(self.pptx_editor, PPTX_TAB_TITLE)
+        self.tabs.addTab(self.pdf_editor, PDF_TAB_TITLE)
+        self.setCentralWidget(self.tabs)
 
         self._build_actions()
         self._build_menus()
@@ -74,8 +133,61 @@ class MainWindow(QMainWindow):
         # и через диалог, и программно (например, из тестов или будущего CLI-GUI).
         self.editor.file_loaded.connect(self._on_file_changed)
         self.editor.file_saved.connect(self._on_file_changed)
+        self.pptx_editor.file_loaded.connect(self._on_file_changed)
+        self.pptx_editor.file_saved.connect(self._on_file_changed)
+        self.pptx_editor.modified_changed.connect(self._on_editor_modified)
+        self.pptx_editor.slide_changed.connect(self._on_selection_changed)
+        self.pdf_editor.file_loaded.connect(self._on_file_changed)
+        self.pdf_editor.file_saved.connect(self._on_file_changed)
+        self.pdf_editor.modified_changed.connect(self._on_editor_modified)
+        self.pdf_editor.page_changed.connect(self._on_selection_changed)
+        self.pdf_editor.status_message.connect(self._show_status_message)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self._refresh_title()
         self._refresh_status()
+
+    def _on_editor_modified(self, _modified: bool) -> None:
+        """Обновить заголовок окна после правки презентации или PDF.
+
+        Args:
+            _modified: Новое значение флага (берётся из редактора).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self._refresh_title()
+
+    def _on_selection_changed(self, _index: int) -> None:
+        """Обновить счётчики при выборе другого слайда или страницы.
+
+        Args:
+            _index: Индекс слайда/страницы (не используется).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self._refresh_status()
+
+    def _show_status_message(self, message: str) -> None:
+        """Показать сообщение редактора в статус-баре.
+
+        Args:
+            message: Текст сообщения.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        if message:
+            self.statusBar().showMessage(message, 8000)
 
     def _on_file_changed(self, _path: str) -> None:
         """Обновить заголовок и статус после открытия/сохранения файла.
@@ -134,6 +246,21 @@ class MainWindow(QMainWindow):
         )
         self.action_russify.triggered.connect(self.russify_document)
 
+        self.action_settings = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
+            "Настройки…",
+            self,
+        )
+        self.action_settings.triggered.connect(self.open_settings)
+
+        self.action_glossary = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogListView),
+            "Редактор словаря…",
+            self,
+        )
+        self.action_glossary.setObjectName("actionGlossary")
+        self.action_glossary.triggered.connect(self.open_glossary_editor)
+
         self.action_about = QAction("О программе", self)
         self.action_about.triggered.connect(self.show_about)
 
@@ -158,22 +285,25 @@ class MainWindow(QMainWindow):
         edit_menu = menubar.addMenu("&Правка")
         undo = edit_menu.addAction("Отменить")
         undo.setShortcut(QKeySequence.StandardKey.Undo)
-        undo.triggered.connect(self.editor.undo)
+        undo.triggered.connect(lambda: self._dispatch_edit("undo"))
         redo = edit_menu.addAction("Вернуть")
         redo.setShortcut(QKeySequence.StandardKey.Redo)
-        redo.triggered.connect(self.editor.redo)
+        redo.triggered.connect(lambda: self._dispatch_edit("redo"))
         edit_menu.addSeparator()
         cut = edit_menu.addAction("Вырезать")
         cut.setShortcut(QKeySequence.StandardKey.Cut)
-        cut.triggered.connect(self.editor.cut)
+        cut.triggered.connect(lambda: self._dispatch_edit("cut"))
         copy = edit_menu.addAction("Копировать")
         copy.setShortcut(QKeySequence.StandardKey.Copy)
-        copy.triggered.connect(self.editor.copy)
+        copy.triggered.connect(lambda: self._dispatch_edit("copy"))
         paste = edit_menu.addAction("Вставить")
         paste.setShortcut(QKeySequence.StandardKey.Paste)
-        paste.triggered.connect(self.editor.paste)
+        paste.triggered.connect(lambda: self._dispatch_edit("paste"))
 
         tools_menu = menubar.addMenu("&Инструменты")
+        tools_menu.addAction(self.action_glossary)
+        tools_menu.addAction(self.action_settings)
+        tools_menu.addSeparator()
         tools_menu.addAction(self.action_russify)
 
         help_menu = menubar.addMenu("С&правка")
@@ -286,6 +416,7 @@ class MainWindow(QMainWindow):
         self.editor.cursorPositionChanged.connect(self._sync_format_actions)
         self.editor.selectionChanged.connect(self._sync_format_actions)
         self._sync_format_actions()
+        self._sync_tab_ui()
 
     def _make_format_action(self, text: str, tooltip: str, object_name: str) -> QAction:
         """Создать действие панели форматирования.
@@ -470,6 +601,105 @@ class MainWindow(QMainWindow):
         self.statusBar().addWidget(self.status_path, 1)
         self.statusBar().addPermanentWidget(self.status_counts)
 
+    # -- вкладки -------------------------------------------------------------
+    def _active_kind(self) -> str:
+        """Тип активной вкладки.
+
+        Returns:
+            str: ``"word"``, ``"pptx"`` или ``"pdf"``.
+
+        Raises:
+            Ничего не бросает.
+        """
+        index = self.tabs.currentIndex()
+        if index == PPTX_TAB_INDEX:
+            return "pptx"
+        if index == PDF_TAB_INDEX:
+            return "pdf"
+        return "word"
+
+    def _is_word_tab(self) -> bool:
+        """Активна ли вкладка Word.
+
+        Returns:
+            bool: ``True`` для DOCX.
+
+        Raises:
+            Ничего не бросает.
+        """
+        return self._active_kind() == "word"
+
+    def _sync_tab_ui(self) -> None:
+        """Подстроить панель форматирования и меню под активную вкладку.
+
+        Панель форматирования работает только с DOCX (PPTX и PDF здесь —
+        текстовые редакторы блоков), поэтому на других вкладках она скрыта.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        kind = self._active_kind()
+        self.format_toolbar.setVisible(kind == "word")
+        self.action_russify.setText(RUSSIFY_LABELS[kind])
+
+    def _on_tab_changed(self, _index: int) -> None:
+        """Обновить интерфейс при переключении вкладки.
+
+        Args:
+            _index: Индекс новой вкладки (не используется).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self._sync_tab_ui()
+        self._refresh_title()
+        self._refresh_status()
+
+    def _edit_target(self) -> QWidget | None:
+        """Виджет, к которому применяются команды меню «Правка».
+
+        Returns:
+            QWidget | None: поле с фокусом, редактор DOCX или первый блок
+            презентации; ``None`` — править нечего.
+
+        Raises:
+            Ничего не бросает.
+        """
+        focused = QApplication.focusWidget()
+        if isinstance(focused, QTextEdit):
+            return focused
+        kind = self._active_kind()
+        if kind == "pptx":
+            editors = self.pptx_editor.block_editors()
+        elif kind == "pdf":
+            editors = self.pdf_editor.block_editors()
+        else:
+            return self.editor
+        return editors[0] if editors else None
+
+    def _dispatch_edit(self, name: str) -> None:
+        """Выполнить команду правки в активном поле ввода.
+
+        Args:
+            name: Имя метода Qt (``undo``, ``redo``, ``cut``, ``copy``, ``paste``).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        target = self._edit_target()
+        method = getattr(target, name, None) if target is not None else None
+        if callable(method):
+            method()
+
     # -- состояние -----------------------------------------------------------
     def _refresh_title(self, *_: object) -> None:
         """Обновить заголовок окна по текущему файлу и флагу изменений.
@@ -483,13 +713,24 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
-        path = self.editor.current_path
-        name = path.name if path is not None else NEW_DOCUMENT
+        kind = self._active_kind()
+        if kind == "pptx":
+            path = self.pptx_editor.current_path
+            name = path.name if path is not None else NEW_PRESENTATION
+            modified = self.pptx_editor.is_modified()
+        elif kind == "pdf":
+            path = self.pdf_editor.current_path
+            name = path.name if path is not None else NEW_PDF
+            modified = self.pdf_editor.is_modified()
+        else:
+            path = self.editor.current_path
+            name = path.name if path is not None else NEW_DOCUMENT
+            modified = self.editor.is_modified()
         self.setWindowTitle(f"{APP_TITLE} — {name}[*]")
-        self.setWindowModified(self.editor.is_modified())
+        self.setWindowModified(modified)
 
     def _refresh_status(self) -> None:
-        """Обновить путь и счётчики слов/символов в статус-баре.
+        """Обновить путь и счётчики в статус-баре под активную вкладку.
 
         Returns:
             None
@@ -497,6 +738,26 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
+        kind = self._active_kind()
+        if kind == "pptx":
+            path = self.pptx_editor.current_path
+            self.status_path.setText(
+                str(path) if path is not None else NEW_PRESENTATION
+            )
+            self.status_counts.setText(
+                f"Слайдов: {self.pptx_editor.slide_count()} · "
+                f"Блоков: {self.pptx_editor.block_count()}"
+            )
+            return
+        if kind == "pdf":
+            path = self.pdf_editor.current_path
+            self.status_path.setText(str(path) if path is not None else NEW_PDF)
+            self.status_counts.setText(
+                f"Страниц: {self.pdf_editor.page_count()} · "
+                f"Блоков: {self.pdf_editor.block_count()}"
+            )
+            return
+
         path = self.editor.current_path
         self.status_path.setText(str(path) if path is not None else NEW_DOCUMENT)
         text = self.editor.toPlainText()
@@ -505,7 +766,7 @@ class MainWindow(QMainWindow):
 
     # -- файлы ---------------------------------------------------------------
     def open_document(self) -> None:
-        """Открыть DOCX через диалог выбора файла.
+        """Открыть файл через диалог; фильтр зависит от активной вкладки.
 
         Returns:
             None
@@ -513,18 +774,67 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
-        filepath, _ = QFileDialog.getOpenFileName(self, "Открыть документ", "", DOCX_FILTER)
+        preferred = {
+            "word": DOCX_FILTER,
+            "pptx": PPTX_FILTER,
+            "pdf": PDF_FILTER,
+        }[self._active_kind()]
+        filepath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Открыть документ",
+            "",
+            f"{preferred};;{ANY_FILTER}",
+        )
         if not filepath:
             return
-        if self.editor.load_file(filepath):
-            self._refresh_title()
-            self._refresh_status()
-            self.statusBar().showMessage("Документ открыт", 3000)
+        self.open_path(filepath)
+
+    def open_path(self, filepath: str) -> bool:
+        """Открыть файл по расширению и переключить вкладку.
+
+        Args:
+            filepath: Путь к ``.docx``, ``.pptx`` или ``.pdf``.
+
+        Returns:
+            bool: ``True``, если файл открыт.
+
+        Raises:
+            Ничего не бросает: ошибки показываются диалогом редактора.
+        """
+        suffix = Path(filepath).suffix.lower()
+        if suffix == ".pdf":
+            index, target = PDF_TAB_INDEX, self.pdf_editor
+        elif suffix == ".pptx":
+            index, target = PPTX_TAB_INDEX, self.pptx_editor
         else:
-            self.statusBar().showMessage("Не удалось открыть документ", 5000)
+            index, target = WORD_TAB_INDEX, self.editor
+        self.tabs.setCurrentIndex(index)
+        if not target.load_file(filepath):
+            self.statusBar().showMessage("Не удалось открыть файл", 5000)
+            return False
+        self._refresh_title()
+        self._refresh_status()
+        self.statusBar().showMessage(f"Открыто: {Path(filepath).name}", 3000)
+        return True
 
     def save_document(self) -> bool:
-        """Сохранить документ; если пути нет — вызвать «Сохранить как».
+        """Сохранить активный документ; если пути нет — «Сохранить как».
+
+        Returns:
+            bool: ``True``, если файл записан.
+
+        Raises:
+            Ничего не бросает.
+        """
+        kind = self._active_kind()
+        if kind == "pptx":
+            return self._save_pptx()
+        if kind == "pdf":
+            return self._save_pdf()
+        return self._save_word()
+
+    def _save_word(self) -> bool:
+        """Сохранить DOCX по известному пути.
 
         Returns:
             bool: ``True``, если файл записан.
@@ -533,7 +843,7 @@ class MainWindow(QMainWindow):
             Ничего не бросает.
         """
         if self.editor.current_path is None:
-            return self.save_document_as()
+            return self._save_as("docx")
         if not self.editor.save_file(str(self.editor.current_path)):
             self.statusBar().showMessage("Не удалось сохранить документ", 5000)
             return False
@@ -541,8 +851,8 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Документ сохранён", 3000)
         return True
 
-    def save_document_as(self) -> bool:
-        """Сохранить под новым именем (расширение ``.docx`` добавляется).
+    def _save_pptx(self) -> bool:
+        """Сохранить PPTX по известному пути.
 
         Returns:
             bool: ``True``, если файл записан.
@@ -550,13 +860,73 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
-        filepath, _ = QFileDialog.getSaveFileName(self, "Сохранить как", "", DOCX_FILTER)
+        if self.pptx_editor.current_path is None:
+            return self._save_as("pptx")
+        if not self.pptx_editor.save_file(str(self.pptx_editor.current_path)):
+            self.statusBar().showMessage("Не удалось сохранить презентацию", 5000)
+            return False
+        self._refresh_title()
+        self.statusBar().showMessage("Презентация сохранена", 3000)
+        return True
+
+    def _save_pdf(self) -> bool:
+        """Сохранить PDF по известному пути.
+
+        Returns:
+            bool: ``True``, если файл записан.
+
+        Raises:
+            Ничего не бросает.
+        """
+        if self.pdf_editor.current_path is None:
+            return self._save_as("pdf")
+        if not self.pdf_editor.save_file(str(self.pdf_editor.current_path)):
+            self.statusBar().showMessage("Не удалось сохранить PDF", 5000)
+            return False
+        self._refresh_title()
+        self.statusBar().showMessage("PDF записан", 3000)
+        return True
+
+    def save_document_as(self) -> bool:
+        """Сохранить активный документ под новым именем.
+
+        Returns:
+            bool: ``True``, если файл записан.
+
+        Raises:
+            Ничего не бросает.
+        """
+        return self._save_as(
+            {"word": "docx", "pptx": "pptx", "pdf": "pdf"}[self._active_kind()]
+        )
+
+    def _save_as(self, kind: str) -> bool:
+        """Диалог «Сохранить как» с расширением по типу документа.
+
+        Args:
+            kind: ``"docx"``, ``"pptx"`` или ``"pdf"``.
+
+        Returns:
+            bool: ``True``, если файл записан.
+
+        Raises:
+            Ничего не бросает.
+        """
+        file_filter, suffix, target = {
+            "docx": (DOCX_FILTER, ".docx", self.editor),
+            "pptx": (PPTX_FILTER, ".pptx", self.pptx_editor),
+            "pdf": (PDF_FILTER, ".pdf", self.pdf_editor),
+        }[kind]
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить как", "", file_filter
+        )
         if not filepath:
             return False
-        if not filepath.lower().endswith(".docx"):
-            filepath += ".docx"
-        if not self.editor.save_file(filepath):
-            self.statusBar().showMessage("Не удалось сохранить документ", 5000)
+        if not filepath.lower().endswith(suffix):
+            filepath += suffix
+
+        if not target.save_file(filepath):
+            self.statusBar().showMessage("Не удалось сохранить файл", 5000)
             return False
         self._refresh_title()
         self._refresh_status()
@@ -564,6 +934,62 @@ class MainWindow(QMainWindow):
         return True
 
     # -- инструменты ---------------------------------------------------------
+    def open_settings(self) -> None:
+        """Открыть диалог настроек: DeepSeek, тема, режим шрифтов PDF.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        dialog = SettingsDialog(self)
+        if dialog.exec() != SettingsDialog.DialogCode.Accepted:
+            return
+
+        state = load_settings()
+        apply_theme(state["theme"])
+        self.pdf_editor.set_font_substitution_mode(state["pdf_fonts"])
+        mode = "ИИ + словарь" if state["use_llm"] else "только словарь"
+        self.statusBar().showMessage(
+            f"Настройки сохранены ({mode}, тема {state['theme']}, "
+            f"PDF {state['pdf_fonts']})",
+            5000,
+        )
+
+    def open_glossary_editor(self) -> None:
+        """Открыть редактор словаря замен и исключений.
+
+        После сохранения диалог уже перечитал файлы через
+        :meth:`GlossaryManager.reload`, поэтому новые слова работают при
+        следующей русификации без перезапуска приложения.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает: ошибки показываются диалогом.
+        """
+        if self.glossary is None:
+            QMessageBox.warning(
+                self,
+                "Редактор словаря",
+                "Словарь недоступен: "
+                + (self._glossary_error or "файлы данных не найдены"),
+            )
+            return
+
+        dialog = GlossaryEditorDialog(self.glossary, self)
+        if dialog.exec() != GlossaryEditorDialog.DialogCode.Accepted:
+            return
+
+        QMessageBox.information(self, "Редактор словаря", "Словарь обновлён")
+        self.statusBar().showMessage(
+            f"Словарь обновлён: {len(self.glossary.glossary)} терминов, "
+            f"исключений: {len(self.glossary.exceptions)}",
+            5000,
+        )
+
     def russify_document(self) -> None:
         """Запустить русификацию в фоне и показать предпросмотр замен.
 
@@ -578,14 +1004,25 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
-        text = self.editor.toPlainText()
+        kind = self._active_kind()
+        if kind == "pptx":
+            text = self.pptx_editor.current_text()
+            empty_message = "На слайде нет текста."
+        elif kind == "pdf":
+            text = self.pdf_editor.current_text()
+            empty_message = "На странице нет текста."
+        else:
+            text = self.editor.toPlainText()
+            empty_message = "Документ пуст."
         if not text.strip():
-            QMessageBox.information(self, "Русификация", "Документ пуст.")
+            QMessageBox.information(self, "Русификация", empty_message)
             return
         if getattr(self, "_worker", None) is not None and self._worker.isRunning():
             return
 
+        settings = load_settings()
         self._rusify_cancelled = False
+        self._rusify_target = kind
         self._progress = QProgressDialog("Идёт анализ документа…", "Отмена", 0, 100, self)
         self._progress.setWindowTitle("Русификация")
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -593,9 +1030,15 @@ class MainWindow(QMainWindow):
         self._progress.setValue(0)
         self._progress.canceled.connect(self._cancel_rusify)
 
-        self.editor.setReadOnly(True)
+        self._set_surface_read_only(True)
 
-        self._worker = RusifyWorker(text, parent=self)
+        self._worker = RusifyWorker(
+            text,
+            parent=self,
+            use_llm=settings["use_llm"],
+            api_key=settings["api_key"],
+            glossary=self.glossary,
+        )
         self._worker.progress.connect(self._progress.setValue)
         self._worker.result_ready.connect(self._on_rusify_ready)
         self._worker.failed.connect(self._on_rusify_failed)
@@ -612,7 +1055,7 @@ class MainWindow(QMainWindow):
             Ничего не бросает.
         """
         self._rusify_cancelled = True
-        self.editor.setReadOnly(False)
+        self._set_surface_read_only(False)
         self.statusBar().showMessage("Русификация отменена", 3000)
 
     def _on_rusify_ready(self, new_text: str, changes: object) -> None:
@@ -630,20 +1073,32 @@ class MainWindow(QMainWindow):
             Ничего не бросает.
         """
         self._close_progress()
-        self.editor.setReadOnly(False)
+        self._set_surface_read_only(False)
         if getattr(self, "_rusify_cancelled", False):
             return
 
         items = [item for item in (changes or []) if isinstance(item, dict)]
         if not items:
+            target = {
+                "word": "документе",
+                "pptx": "слайде",
+                "pdf": "странице",
+            }.get(getattr(self, "_rusify_target", "word"), "документе")
             QMessageBox.information(
-                self, "Русификация", "Словарных замен в документе не найдено."
+                self, "Русификация", f"Словарных замен в {target} не найдено."
             )
             return
 
         dialog = ReplacementsDialog(items, self)
         if dialog.exec() == ReplacementsDialog.DialogCode.Accepted:
-            applied = self.apply_replacements(dialog.selected_replacements())
+            pairs = dialog.selected_replacements()
+            surface = getattr(self, "_rusify_target", "word")
+            if surface == "pptx":
+                applied = self.pptx_editor.apply_replacements(pairs)
+            elif surface == "pdf":
+                applied = self.pdf_editor.apply_replacements(pairs)
+            else:
+                applied = self.apply_replacements(pairs)
             self.statusBar().showMessage(f"Применено замен: {applied}", 5000)
         else:
             self.statusBar().showMessage("Русификация отменена", 3000)
@@ -661,7 +1116,7 @@ class MainWindow(QMainWindow):
             Ничего не бросает.
         """
         self._close_progress()
-        self.editor.setReadOnly(False)
+        self._set_surface_read_only(False)
         QMessageBox.critical(self, "Ошибка русификации", message)
 
     def _on_rusify_finished(self) -> None:
@@ -673,7 +1128,27 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
-        self.editor.setReadOnly(False)
+        self._set_surface_read_only(False)
+
+    def _set_surface_read_only(self, read_only: bool) -> None:
+        """Заблокировать тот редактор, для которого запущена русификация.
+
+        Args:
+            read_only: ``True`` — запретить правку на время анализа.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        surface = getattr(self, "_rusify_target", "word")
+        if surface == "pptx":
+            self.pptx_editor.set_read_only(read_only)
+        elif surface == "pdf":
+            self.pdf_editor.set_read_only(read_only)
+        else:
+            self.editor.setReadOnly(read_only)
 
     def _close_progress(self) -> None:
         """Закрыть и уничтожить прогресс-диалог, если он открыт.
@@ -755,14 +1230,19 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
-        if not self.editor.is_modified():
+        if not (
+            self.editor.is_modified()
+            or self.pptx_editor.is_modified()
+            or self.pdf_editor.is_modified()
+        ):
+            self.pdf_editor.close_document()
             event.accept()
             return
 
         answer = QMessageBox.question(
             self,
             "Несохранённые изменения",
-            "Сохранить изменения в документе?",
+            "Сохранить изменения перед закрытием?",
             QMessageBox.StandardButton.Save
             | QMessageBox.StandardButton.Discard
             | QMessageBox.StandardButton.Cancel,
@@ -771,9 +1251,25 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.StandardButton.Cancel:
             event.ignore()
             return
-        if answer == QMessageBox.StandardButton.Save and not self.save_document():
-            event.ignore()
-            return
+        if answer == QMessageBox.StandardButton.Save:
+            # Сохраняем каждую изменённую поверхность, переключая вкладку:
+            # диалог «Сохранить как» берёт тип файла из активной вкладки.
+            if self.editor.is_modified():
+                self.tabs.setCurrentIndex(WORD_TAB_INDEX)
+                if not self._save_word():
+                    event.ignore()
+                    return
+            if self.pptx_editor.is_modified():
+                self.tabs.setCurrentIndex(PPTX_TAB_INDEX)
+                if not self._save_pptx():
+                    event.ignore()
+                    return
+            if self.pdf_editor.is_modified():
+                self.tabs.setCurrentIndex(PDF_TAB_INDEX)
+                if not self._save_pdf():
+                    event.ignore()
+                    return
+        self.pdf_editor.close_document()
         event.accept()
 
 
