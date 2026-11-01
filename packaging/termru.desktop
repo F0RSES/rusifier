@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
 Name=TermRu
-Comment=Замена англицизмов в документах
-Exec=termru --help
+Comment=Замена англицизмов в документах DOCX/PPTX/PDF
+Exec=/opt/termru/TermRu
 Icon=termru
-Terminal=true
+Terminal=false
 Categories=Office;Utility;

@@ -1,10 +1,13 @@
 """Виджет редактора PDF: страницы слева, рендер в центре, блоки справа.
 
 PDF не поддерживает потоковое редактирование, поэтому интерфейс разбит на три
-панели: список страниц, картинка текущей страницы (PyMuPDF) и текстовые блоки
-этой страницы. Правки копятся в памяти и записываются только при сохранении —
-через :meth:`DocumentProcessor.apply_replacements`, который переносит текст по
-bbox строк и сам подбирает шрифт с кириллицей (DejaVu).
+панели: список страниц, картинка текущей страницы (PDFium через pypdfium2) и
+текстовые блоки этой страницы. Правки копятся в памяти и записываются только при
+сохранении — через :meth:`DocumentProcessor.apply_replacements`, который
+переносит текст по bbox строк и сам подбирает шрифт с кириллицей (DejaVu).
+
+Рендер вынесен на ``pypdfium2``: PDFium занимает ~8 МБ против ~50 МБ у PyMuPDF,
+а в собранном GUI-дистрибутиве каждый мегабайт на счету.
 """
 
 from __future__ import annotations
@@ -12,11 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Sequence
 
-try:  # PyMuPDF >= 1.24: рекомендуемое имя, ``fitz`` — устаревший алиас
-    import pymupdf
-except ImportError:  # pragma: no cover - старые сборки PyMuPDF
-    import fitz as pymupdf  # type: ignore[no-redef]
-
+import pypdfium2 as pdfium
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
@@ -246,15 +245,16 @@ class PdfEditor(QWidget):
         try:
             if not path.is_file():
                 raise FileNotFoundError(f"Файл не найден: {path}")
-            document = pymupdf.open(str(path))
-            if getattr(document, "needs_pass", False):
-                raise ValueError("PDF защищён паролем")
-            if document.page_count <= 0:
+            document = pdfium.PdfDocument(str(path))
+            if len(document) <= 0:
                 raise ValueError("В документе нет страниц")
         except Exception as exc:  # noqa: BLE001 - битый файл, не PDF, пароль
             if document is not None:
                 document.close()
-            self._show_error("Не удалось открыть PDF", exc)
+            message = str(exc)
+            if "password" in message.lower():
+                message = "PDF защищён паролем — снимите защиту и откройте файл снова"
+            self._show_error("Не удалось открыть PDF", RuntimeError(message))
             return False
 
         try:
@@ -267,11 +267,11 @@ class PdfEditor(QWidget):
         self.close_document()
         self._document = document
         self.current_path = path
-        self._load_blocks(blocks, document.page_count)
+        self._load_blocks(blocks, len(document))
 
         self.page_list.blockSignals(True)
         self.page_list.clear()
-        for index in range(document.page_count):
+        for index in range(len(document)):
             self.page_list.addItem(QListWidgetItem(f"{PAGE_PREFIX} {index + 1}"))
         self.page_list.blockSignals(False)
 
@@ -437,21 +437,27 @@ class PdfEditor(QWidget):
     def _already_processed(self) -> bool:
         """Содержит ли открытый PDF шрифты, которые внедряет TermRu.
 
+        Шрифты читаются через ``pdf_edit_engine.get_fonts``: pypdfium2 нужен
+        только для рендера и перечислять шрифты не умеет.
+
         Returns:
             bool: ``True``, если файл уже проходил обработку.
 
         Raises:
             Ничего не бросает: ошибки чтения шрифтов считаются «неизвестно».
         """
-        if self._document is None:
+        if self.current_path is None:
             return False
-        for index in range(self.page_count()):
-            try:
-                fonts = self._document.load_page(index).get_fonts()
-            except Exception:  # noqa: BLE001 - битая страница не блокирует запись
-                continue
-            for font in fonts:
-                if str(font[3] or "").startswith(PDF_OWN_FONT_PREFIXES):
+        try:
+            import pdf_edit_engine  # noqa: PLC0415 - тяжёлый импорт, нужен по факту
+
+            fonts = pdf_edit_engine.get_fonts(str(self.current_path))
+        except Exception:  # noqa: BLE001 - движок может отсутствовать/упасть
+            return False
+        for font in fonts:
+            for attribute in ("name", "postscript_name"):
+                value = str(getattr(font, attribute, "") or "")
+                if value.startswith(PDF_OWN_FONT_PREFIXES):
                     return True
         return False
 
@@ -596,16 +602,21 @@ class PdfEditor(QWidget):
         """
         self._page_pixmap = None
         try:
-            page = self._document.load_page(index)
-            pixmap = page.get_pixmap(matrix=pymupdf.Matrix(ZOOM, ZOOM), alpha=False)
-            image = QImage(
-                pixmap.samples,
-                pixmap.width,
-                pixmap.height,
-                pixmap.stride,
-                QImage.Format.Format_RGB888,
-            )
-            self._page_pixmap = QPixmap.fromImage(image.copy())
+            page = self._document[index]
+            bitmap = page.render(scale=ZOOM)
+            try:
+                image = QImage(
+                    bitmap.buffer,
+                    bitmap.width,
+                    bitmap.height,
+                    bitmap.stride,
+                    QImage.Format.Format_RGB888,
+                )
+                # ``copy`` обязателен: буфер bitmap освобождается ниже.
+                self._page_pixmap = QPixmap.fromImage(image.copy())
+            finally:
+                bitmap.close()
+                page.close()
         except Exception as exc:  # noqa: BLE001 - битая страница не должна ронять окно
             self._show_error("Не удалось отрисовать страницу", exc)
         if self._page_pixmap is None:
@@ -761,7 +772,7 @@ class PdfEditor(QWidget):
         """
         if self._document is None:
             return 0
-        return int(self._document.page_count)
+        return len(self._document)
 
     def block_count(self) -> int:
         """Количество блоков на текущей странице.

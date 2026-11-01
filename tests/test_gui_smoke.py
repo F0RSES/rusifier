@@ -1612,6 +1612,93 @@ def test_russify_uses_edited_glossary(tmp_path: Path) -> None:
     assert report["text_after"] == "Our устройство is ready", report["text_after"]
 
 
+def _project_root() -> Path:
+    """Корень проекта.
+
+    Returns:
+        Path: каталог, где лежат ``unifypy.json`` и точки входа.
+
+    Raises:
+        Ничего не бросает.
+    """
+    return Path(__file__).resolve().parents[1]
+
+
+def test_gui_entry_module_imports() -> None:
+    """``termru_gui_entry.py`` импортируется и выбирает режим по аргументам."""
+    root = _project_root()
+    assert (root / "termru_gui_entry.py").is_file(), "нет termru_gui_entry.py"
+    assert (root / "termru_cli_entry.py").is_file(), "нет termru_cli_entry.py (CLI)"
+    assert not (root / "termru_entry.py").exists(), "осталась старая точка входа"
+
+    script = """
+import json
+
+import termru_gui_entry as entry
+
+print(json.dumps({
+    "no_args": entry.use_cli_mode([]),
+    "with_input": entry.use_cli_mode(["--input", "x.docx"]),
+    "version": entry.use_cli_mode(["--version"]),
+    "gui_flag": entry.use_cli_mode([entry.GUI_FLAG]),
+    "smoke_flag": entry.use_cli_mode([entry.GUI_SMOKE_FLAG]),
+    "main_callable": callable(entry.main),
+}))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        cwd=str(root),
+    )
+
+    assert completed.returncode == 0, completed.stderr[-3000:]
+    report = json.loads(completed.stdout.strip().splitlines()[-1])
+
+    assert report["no_args"] is False, "без аргументов должен стартовать GUI"
+    assert report["with_input"] is True, "аргументы должны включать CLI"
+    assert report["version"] is True
+    assert report["gui_flag"] is False
+    assert report["smoke_flag"] is False
+    assert report["main_callable"] is True
+
+
+def test_unifypy_config_builds_gui() -> None:
+    """``unifypy.json`` собирает GUI-версию и не тянет тяжёлые модули Qt."""
+    config = json.loads(
+        (_project_root() / "unifypy.json").read_text(encoding="utf-8")
+    )
+
+    assert config["entry"] == "termru_gui_entry.py"
+    assert config["name"] == "TermRu", "имя приложения влияет на имя бинарника"
+    assert config.get("package") == "termru", "имя deb-пакета должно быть в нижнем регистре"
+
+    pyinstaller = config["pyinstaller"]
+    hidden = set(pyinstaller["hidden_import"])
+    assert {"PySide6.QtSvg", "PySide6.QtPrintSupport"} <= hidden, hidden
+    assert "qdarkstyle" in hidden, "стили темы иначе не попадут в бандл"
+
+    excludes = set(pyinstaller["exclude_module"])
+    for module in (
+        "PySide6.QtWebEngineCore",
+        "PySide6.QtWebEngineWidgets",
+        "PySide6.QtMultimedia",
+        "PySide6.Qt3DCore",
+        "PySide6.QtCharts",
+        "PySide6.QtDataVisualization",
+        "PySide6.QtQuick",
+        "PySide6.QtQml",
+    ):
+        assert module in excludes, f"{module} не исключён — бандл раздуется"
+    # PDF-редактор рендерит страницы через pypdfium2 (~8 МБ), а тяжёлый
+    # PyMuPDF (~50 МБ) в бандл не попадает.
+    assert "pymupdf" in excludes
+    assert "fitz" in excludes
+    assert "pypdfium2" not in excludes
+    assert "pypdfium2_raw" not in excludes
+
+
 def test_gui_entrypoint_imports() -> None:
     """``python -m src.gui.main`` импортируется без запуска цикла событий."""
     script = """

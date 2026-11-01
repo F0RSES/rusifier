@@ -25,8 +25,6 @@ from src.pdf_fonts import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEJAVU = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-#: Размер .deb до бандлинга шрифтов (stage 5) — база для проверки +5 %.
-DEB_BASELINE_BYTES = 73_015_004
 SOURCE_LINE = "The feedback from the meeting was clear."
 NEW_LINE = "The обратная связь from the meeting was clear."
 OTHER_LINE = "Second line about deadline and roadmap."
@@ -424,17 +422,23 @@ def test_resolver_works_on_windows_like_env(
     assert path.name == "DejaVuSans-Bold.ttf"
 
 
-def test_deb_size_increase_under_5_percent() -> None:
-    """Собранный .deb вырос не более чем на 5 % относительно baseline."""
-    debs = sorted((PROJECT_ROOT / "dist").glob("termru_*.deb"))
+def test_deb_size_within_limit() -> None:
+    """Собранный .deb укладывается в лимит 100 МиБ.
+
+    Раньше здесь проверялся рост относительно CLI-сборки (73 МБ +5 %). Теперь
+    пакет — GUI с Qt (распакованный бандл ~315 МиБ, сжатие xz), поэтому
+    осмысленный предел — 100 МиБ: это и требование к установщику, и страховка от
+    возврата тяжёлых модулей (Qt WebEngine добавляет ~150 МиБ, PyMuPDF — ~50 МиБ).
+    """
+    debs = sorted((PROJECT_ROOT / "dist").glob("[Tt]erm[Rr]u_*.deb"))
     if not debs:
         pytest.skip("нет dist/termru_*.deb — соберите packaging/build-deb.sh")
 
-    size = debs[0].stat().st_size
-    growth = (size - DEB_BASELINE_BYTES) / DEB_BASELINE_BYTES
+    size = debs[-1].stat().st_size
+    limit = 100 * 1024 * 1024
 
-    assert growth < 0.05, (
-        f"{debs[0].name}: {size} байт (+{growth:.2%}) — больше лимита 5 %"
+    assert size < limit, (
+        f"{debs[-1].name}: {size / 1024 / 1024:.1f} МиБ — больше лимита 100 МиБ"
     )
 
 

@@ -21,7 +21,9 @@ bad() { fail=$((fail + 1)); printf '  FAIL  %s\n' "$1"; }
 
 find_deb() {
   local candidate
-  for candidate in "$ROOT"/tests/fixtures/termru_*.deb "$ROOT"/dist/termru_*.deb; do
+  # Имя пакета берётся из "package" в unifypy.json (termru), а файл unifypy
+  # называет по "name" — TermRu_<version>_amd64.deb. Пускаем оба варианта.
+  for candidate in "$ROOT"/tests/fixtures/[Tt]erm[Rr]u_*.deb "$ROOT"/dist/[Tt]erm[Rr]u_*.deb; do
     if [[ -f "$candidate" ]]; then
       printf '%s\n' "$candidate"
       return 0
@@ -66,12 +68,12 @@ dpkg-deb -x "$OUT" "$WORK/extract"
 DESKTOP="$WORK/extract/usr/share/applications/termru.desktop"
 if [[ -f "$DESKTOP" ]]; then
   ok "termru.desktop на месте"
-  if grep -qx 'Exec=/opt/termru/termru --help' "$DESKTOP"; then
-    ok "Exec=/opt/termru/termru --help"
+  if grep -qx 'Exec=/opt/termru/TermRu' "$DESKTOP"; then
+    ok "Exec=/opt/termru/TermRu"
   else
     bad "Exec неверный: $(grep '^Exec=' "$DESKTOP" || echo '<нет>')"
   fi
-  grep -qx 'Terminal=true' "$DESKTOP" && ok "Terminal=true" || bad "Terminal не true"
+  grep -qx 'Terminal=false' "$DESKTOP" && ok "Terminal=false" || bad "Terminal не false"
   grep -qx 'Icon=termru' "$DESKTOP" && ok "Icon=termru" || bad "Icon не termru"
 else
   bad "termru.desktop отсутствует"
@@ -81,8 +83,10 @@ fi
   && ok "иконка в /usr/share/pixmaps" || bad "иконки в pixmaps нет"
 [[ -f "$WORK/extract/usr/share/icons/hicolor/256x256/apps/termru.png" ]] \
   && ok "иконка в hicolor" || bad "иконки в hicolor нет"
-[[ -x "$WORK/extract/opt/termru/termru" ]] \
-  && ok "бинарник на месте и исполняемый" || bad "бинарника нет"
+[[ -x "$WORK/extract/opt/termru/TermRu" ]] \
+  && ok "GUI-бинарник на месте и исполняемый" || bad "бинарника TermRu нет"
+[[ -x "$WORK/extract/usr/local/bin/termru-cli" ]] \
+  && ok "CLI-алиас /usr/local/bin/termru-cli" || bad "termru-cli нет"
 
 echo "== идемпотентность =="
 OUT2="$WORK/fixed2.deb"
@@ -93,7 +97,7 @@ else
 fi
 count2="$(count_desktop "$OUT2")"
 [[ "$count2" == "1" ]] && ok "после повтора один .desktop" || bad "после повтора .desktop: $count2"
-grep -qx 'Exec=/opt/termru/termru --help' <(dpkg-deb --fsys-tarfile "$OUT2" \
+grep -qx 'Exec=/opt/termru/TermRu' <(dpkg-deb --fsys-tarfile "$OUT2" \
   | tar -xO ./usr/share/applications/termru.desktop) \
   && ok "Exec не изменился после повтора" || bad "Exec изменился после повтора"
 

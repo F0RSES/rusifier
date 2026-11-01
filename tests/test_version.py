@@ -20,6 +20,8 @@ EXPECTED_VERSION = "0.2.0"
 
 #: Собранный бинарник: onedir (`dist/termru/termru`) или onefile (`dist/termru`).
 _BINARY_CANDIDATES = (
+    PROJECT_ROOT / "dist" / "TermRu" / "TermRu",
+    PROJECT_ROOT / "dist" / "TermRu",
     PROJECT_ROOT / "dist" / "termru" / "termru",
     PROJECT_ROOT / "dist" / "termru",
 )
@@ -74,7 +76,7 @@ def test_strip_is_linux_only() -> None:
 
 def test_deb_version() -> None:
     """Собранный .deb несёт ту же версию в имени файла и в метаданных."""
-    debs = sorted((PROJECT_ROOT / "dist").glob("termru_*.deb"))
+    debs = sorted((PROJECT_ROOT / "dist").glob("[Tt]erm[Rr]u_*.deb"))
     if not debs:
         pytest.skip("нет собранного .deb (нужен packaging/build-deb.sh)")
 

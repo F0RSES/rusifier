@@ -32,18 +32,24 @@ termru.exe --help
 ```bash
 sudo dpkg -i termru_0.2.0_amd64.deb
 sudo apt-get install -f     # если не хватает зависимостей
-termru --help
+TermRu                      # графический редактор
+termru-cli --help           # консольный режим
 ```
 
-Пакет кладёт приложение в `/opt/termru`, ссылку `/usr/local/bin/termru`,
-`.desktop`-файл и иконку в `/usr/share`.
+Пакет кладёт приложение в `/opt/termru` (`/opt/termru/TermRu` — GUI), ссылки
+`/usr/local/bin/termru` и `/usr/local/bin/termru-cli`, `.desktop`-файл
+(`Exec=/opt/termru/TermRu`, `Terminal=false`) и иконку в `/usr/share`.
+
+GUI и CLI — **один и тот же бинарник**: без аргументов запускается редактор, с
+аргументами — консольный режим (`TermRu --input report.docx --json` работает так
+же, как `termru-cli --input ...`).
 
 ### Arch Linux
 
 ```bash
 packaging/build-arch.sh                 # соберёт onefile-бинарник и tar.gz
 cd packaging/arch && makepkg -si        # установит termru-bin
-termru --help
+TermRu                                  # GUI; termru --help — консоль
 ```
 
 ### Из исходников
@@ -440,38 +446,58 @@ python -m src.gui.main            # тёмная тема, меню, панел�
 | 19 | Cache-метрики в `--json` | `summary.llm` с токенами и `cache_hit_ratio` |
 | 20 | Финализация | тег `v0.2.0-mvp`, README, **production-ready MVP** |
 
-GUI (этапы 1–6): редактор DOCX в PySide6, панель форматирования, настройки DeepSeek с
+GUI (этапы 1–7): редактор DOCX в PySide6, панель форматирования, настройки DeepSeek с
 diff-предпросмотром замен, вкладка PowerPoint с текстовым редактором слайдов, вкладка PDF
-с предпросмотром страницы и правкой блоков, редактор словаря/исключений и настройки темы
-с режимом шрифтов PDF.
+с предпросмотром страницы и правкой блоков, редактор словаря/исключений, настройки темы
+с режимом шрифтов PDF и GUI-сборка дистрибутивов (один бинарник на GUI и CLI).
 
-Тесты: `pytest tests/ -q` (211), `bash tests/test_deb_desktop.sh` (15), `bash tests/test_git_repo.sh` (7).
+Тесты: `pytest tests/ -q` (213), `bash tests/test_deb_desktop.sh` (16), `bash tests/test_git_repo.sh` (7).
 
 ## Сборка дистрибутивов
 
 Конфигурация — `unifypy.json`, хуки PyInstaller — `packaging/hooks/`
-(они собирают подмодули `polydoc`, который регистрирует readers/writers
-динамически). Точка входа для сборки — `termru_entry.py`: PyInstaller запускает
-скрипт без пакета, поэтому относительные импорты `src/cli.py` в нём не работают.
+(они собирают подмодули `polydoc`, `pdf_edit_engine`, `fontTools`, а также
+ресурсы `qdarkstyle`). Точки входа:
 
-Размер `.deb` — **~49 МиБ** (см. `docs/build-size-report.md`). Из сборки исключены
-`numpy`/`onnxruntime`/`pymupdf`-layout, `pypdfium2`/`pdfplumber` и форматы polydoc, которые CLI
-не поддерживает (`txt/markdown/html/json/csv/xlsx`). Если добавляете формат в
-`SUPPORTED_FORMATS`, не забудьте убрать его модуль из `exclude_module` — иначе он попадёт в
-`unavailable` и не откроется; `tests/test_packaged_binary.py` проверяет DOCX/PPTX/PDF из
-собранного бинарника.
+* **`termru_gui_entry.py`** — основная сборка: без аргументов GUI, с аргументами
+  CLI, `--gui-smoke` — проверка окна для CI (поднимает Qt и выходит);
+* **`termru_cli_entry.py`** — «чистый» консольный бинарник без PySide6, если нужен
+  минимальный размер. PyInstaller запускает скрипт без пакета, поэтому
+  относительные импорты `src/*` в точках входа не работают.
+
+`unifypy.json` задаёт `name: TermRu` (имя бинарника и приложения) и
+`package: termru` (имя deb-пакета в нижнем регистре). Qt-модули, которые
+приложению не нужны — WebEngine, Multimedia, 3D, Charts, DataVisualization,
+Quick/Qml, Sql, Designer, Pdf — перечислены в `exclude_module`: без этих
+исключений бандл вырастает до 200+ МиБ. Там же `pymupdf`/`fitz`: предпросмотр
+страниц PDF рисует `pypdfium2` (~8 МиБ вместо ~50 МиБ).
+
+PyInstaller собирает **все** Qt-плагины, включая плагин системной GTK-темы, а он
+тянет ~26 МиБ (gtk3, gdk-pixbuf, glycin, gnutls, p11-kit). Приложение рисует себя
+само через qdarkstyle, поэтому `packaging/trim_bundle.py` удаляет лишние каталоги
+плагинов (platformthemes, sqldrivers, qmltooling, egldeviceintegrations, generic,
+tls, networkinformation, designer) и осиротевшие библиотеки — те, на которые
+после этого нет `DT_NEEDED` (замыкание считается по `readelf -d`). Скрипт
+вызывается из `fix-deb-desktop.sh` для payload `.deb` и из `build-deb.sh` — для
+распакованного `dist/TermRu`.
+
+Размер `.deb` — **~92–97 МиБ** (GUI с Qt; прежняя CLI-версия была ~49 МиБ):
+318 МиБ распакованного бандла → 293 МиБ после обрезки → ~95 МиБ пакета с
+сжатием xz (zstd даёт на 4–5 МиБ больше). Дополнительно исключены
+`numpy`/`onnxruntime`, `pdfplumber`, `pypdfium2` не исключён (нужен для рендера),
+а форматы polydoc без поддержки (`txt/markdown/html/json/csv/xlsx`) — исключены;
+если добавляете формат в `SUPPORTED_FORMATS`, уберите его модуль из
+`exclude_module` — иначе он попадёт в `unavailable`. `tests/test_packaged_binary.py`
+проверяет DOCX/PPTX/PDF из собранного бинарника и общий бюджет бандла.
 
 ```bash
 # Ubuntu/Debian: .deb (нужны dpkg-deb, dpkg-dev и fakeroot)
-PATH=.venv/bin:$PATH python -m unifypy . --config unifypy.json --format deb
-
-# unifypy.json отключает собственный .desktop unifypy (Terminal=false, клик
-# ничего не открывает) и вместе с ним иконку — скрипт ставит наш .desktop
-# и иконку, затем пересобирает пакет
-bash packaging/fix-deb-desktop.sh installer/termru_*.deb dist/termru_*.deb
-
-# либо одной командой: сборка + замена .desktop + копирование в dist/
+# сборка + .desktop + иконка + CLI-алиас + проверка размера (≤100 МиБ)
 packaging/build-deb.sh
+
+# вручную
+PATH=.venv/bin:$PATH python -m unifypy . --config unifypy.json --format deb
+bash packaging/fix-deb-desktop.sh installer/termru_*.deb dist/termru_*.deb
 
 # Linux onefile-бинарник (используется пакетом для Arch)
 python -m unifypy . --config unifypy.json --onefile --skip-installer
@@ -480,9 +506,22 @@ python -m unifypy . --config unifypy.json --onefile --skip-installer
 packaging/build-arch.sh
 ```
 
-Скрипты удаляют `termru.spec` перед сборкой: unifypy кеширует spec по конфигу и
+Скрипты удаляют `TermRu.spec` перед сборкой: unifypy кеширует spec по конфигу и
 не учитывает `--format`/`--onefile`, из-за чего после onefile-сборки deb-этап
 падает на «PyInstaller输出文件不存在».
+
+### CI (`\.github/workflows/build.yml`)
+
+Обе задачи собирают GUI-версию из одного `unifypy.json`:
+
+| Задача | Что проверяется |
+|---|---|
+| `windows-exe` | `dist/TermRu.exe` собран, размер 40–120 МБ, `TermRu.exe --version` → код 0, конвертация фикстуры CLI-режимом создаёт файл |
+| `linux-deb` | `dist/termru_*.deb` собирается (`packaging/build-deb.sh`), `tests/test_deb_desktop.sh`, GUI поднимается под `xvfb-run -a /opt/termru/TermRu --gui-smoke`, `termru-cli --dry-run --json` даёт отчёт, размер пакета ≤ 100 МиБ |
+
+GUI-проверка в Linux-job требует виртуального дисплея — в job ставится `xvfb`
+и библиотеки xcb/EGL. Флаг `--gui-smoke` поднимает окно, проверяет, что в нём три
+вкладки, и сразу выходит с кодом 0 — без ожидания действий пользователя.
 
 Windows `.exe` **нельзя собрать на Linux**: PyInstaller не поддерживает
 кросс-компиляцию, и unifypy для цели `exe` просто вызывает PyInstaller, который
