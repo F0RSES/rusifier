@@ -58,6 +58,20 @@ def test_version_consistency() -> None:
     assert f"<{EXPECTED_VERSION}>" not in readme, "остался плейсхолдер версии"
 
 
+def test_strip_is_linux_only() -> None:
+    """``strip`` не живёт в общем конфиге: Windows-сборка падала из-за него.
+
+    Флаг включается только в ``packaging/build-deb.sh`` через временный конфиг.
+    """
+    config = json.loads(_read(PROJECT_ROOT / "unifypy.json"))
+    assert "strip" not in config["pyinstaller"], (
+        "strip в unifypy.json сломает сборку .exe на Windows"
+    )
+
+    script = _read(PROJECT_ROOT / "packaging" / "build-deb.sh")
+    assert '["strip"] = True' in script, "build-deb.sh должен включать strip для Linux"
+
+
 def test_deb_version() -> None:
     """Собранный .deb несёт ту же версию в имени файла и в метаданных."""
     debs = sorted((PROJECT_ROOT / "dist").glob("termru_*.deb"))

@@ -52,8 +52,7 @@
       "polydoc.formats.writers.json_native",
       "polydoc.formats.writers.delimited",
       "polydoc.formats.writers.xlsx"
-    ],
-    "strip": true
+    ]
   },
   "platforms": {
     "windows": {
