@@ -46,6 +46,10 @@ toolbars = window.findChildren(QToolBar)
 report["central_is_editor"] = isinstance(window.centralWidget(), DocxEditor)
 report["menus"] = [action.text() for action in window.menuBar().actions()]
 report["toolbar_actions"] = len(toolbars[0].actions()) if toolbars else 0
+report["toolbar_count"] = len(toolbars)
+report["format_actions"] = [
+    action.objectName() for action in window.format_toolbar.actions() if action.objectName()
+]
 report["status_path"] = window.status_path.text()
 report["status_counts"] = window.status_counts.text()
 report["title"] = window.windowTitle()
@@ -136,6 +140,143 @@ print(json.dumps(report, ensure_ascii=False))
 )
 
 
+#: Проверка панели форматирования и вставки таблицы/списка.
+_SCRIPT_FORMAT = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont, QTextCursor, QTextListFormat
+
+editor = window.editor
+editor.setPlainText("hello world")
+cursor = editor.textCursor()
+cursor.select(QTextCursor.SelectionType.Document)
+editor.setTextCursor(cursor)
+
+window.action_bold.setChecked(True)
+window.action_italic.setChecked(True)
+window.action_underline.setChecked(True)
+report["bold"] = editor.fontWeight() >= QFont.Weight.Bold
+report["italic"] = bool(editor.fontItalic())
+report["underline"] = bool(editor.fontUnderline())
+
+window.action_align_center.trigger()
+report["align_center"] = bool(editor.alignment() & Qt.AlignmentFlag.AlignHCenter)
+
+editor.setPlainText("item one")
+window.insert_list(QTextListFormat.Style.ListDisc)
+report["has_list"] = "<ul" in editor.toHtml() or "list-style" in editor.toHtml()
+
+window.insert_table(2, 3)
+report["has_table"] = "<table" in editor.toHtml()
+
+editor.moveCursor(QTextCursor.MoveOperation.Start)
+report["bold_action_unchecked"] = not window.action_bold.isChecked()
+
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка QThread-воркера с подменённым движком.
+_SCRIPT_WORKER = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtCore import QEventLoop, QTimer
+
+from src.gui.rusify import RusifyWorker
+
+
+class FakeEngine:
+    def replace_dict_only(self, text):
+        return (
+            text.replace("feedback", "обратная связь"),
+            [
+                {
+                    "original": "feedback",
+                    "replacement": "обратная связь",
+                    "source": "dict",
+                    "position": 4,
+                }
+            ],
+        )
+
+
+events = {"progress": [], "result": None, "error": None}
+loop = QEventLoop()
+worker = RusifyWorker("the feedback is clear", engine=FakeEngine())
+worker.progress.connect(events["progress"].append)
+
+
+def _done(text, changes):
+    events["result"] = [text, changes]
+    loop.quit()
+
+
+def _failed(message):
+    events["error"] = message
+    loop.quit()
+
+
+worker.result_ready.connect(_done)
+worker.failed.connect(_failed)
+worker.start()
+QTimer.singleShot(10000, loop.quit)
+loop.exec()
+worker.wait(3000)
+
+report["progress"] = events["progress"]
+report["result"] = events["result"]
+report["error"] = events["error"]
+report["thread_finished"] = worker.isFinished()
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка диалога предпросмотра и применения замен в редакторе.
+_SCRIPT_PREVIEW = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtCore import Qt
+
+from src.gui.rusify import ReplacementsDialog
+
+changes = [
+    {"original": "feedback", "replacement": "обратная связь"},
+    {"original": "meeting", "replacement": "встреча"},
+]
+dialog = ReplacementsDialog(changes, window)
+report["rows"] = dialog.table.rowCount()
+report["headers"] = [
+    dialog.table.horizontalHeaderItem(index).text() for index in range(3)
+]
+report["selected_before"] = [pair[0] for pair in dialog.selected_replacements()]
+dialog.table.item(1, 2).setCheckState(Qt.CheckState.Unchecked)
+report["selected_after"] = [pair[0] for pair in dialog.selected_replacements()]
+dialog.deleteLater()
+
+window.editor.setPlainText("the feedback and meeting are here")
+report["applied"] = window.apply_replacements(
+    [("feedback", "обратная связь"), ("meeting", "встреча")]
+)
+report["text_after"] = window.editor.toPlainText()
+
+# Замена внутри жирного фрагмента не должна терять формат.
+window.editor.setHtml("<p>Our <b>feedback</b> is ready</p>")
+window.apply_replacements([("feedback", "обратная связь")])
+html_after = window.editor.toHtml()
+report["bold_kept"] = "font-weight:700" in html_after and "обратная связь" in html_after
+
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
 def _gui_environment() -> dict[str, str]:
     """Окружение подпроцесса: offscreen и Qt-библиотеки из PySide6.
 
@@ -193,9 +334,27 @@ def test_main_window_builds_ui() -> None:
     assert report["central_is_editor"] is True
     assert len(report["menus"]) == 4, report["menus"]
     assert report["toolbar_actions"] >= 3
+    assert report["toolbar_count"] == 2
     assert report["status_path"] == "Новый документ"
     assert report["status_counts"] == "Слов: 0 · Символов: 0"
     assert report["title"].startswith("TermRu — Редактор документов")
+
+
+def test_format_toolbar_actions_exist() -> None:
+    """На панели форматирования есть B/I/U, выравнивание, списки и таблица."""
+    report = _run_gui_script(_SCRIPT_UI)
+
+    assert report["format_actions"] == [
+        "action_bold",
+        "action_italic",
+        "action_underline",
+        "action_align_left",
+        "action_align_center",
+        "action_align_right",
+        "action_bullet_list",
+        "action_numbered_list",
+        "action_table",
+    ]
 
 
 def test_open_and_save_keep_table_and_bold(tmp_path: Path) -> None:
@@ -233,6 +392,46 @@ def test_modified_flag_and_error_reporting() -> None:
     assert report["after_edit"] is True
     assert report["missing_file_result"] is False
     assert report["error_shown"] is True
+
+
+def test_format_actions_apply() -> None:
+    """Жирный/курсив/подчёркивание и выравнивание меняют формат выделения."""
+    report = _run_gui_script(_SCRIPT_FORMAT)
+
+    assert report["bold"] is True
+    assert report["italic"] is True
+    assert report["underline"] is True
+    assert report["align_center"] is True
+    assert report["has_list"] is True, "маркированный список не создался"
+    assert report["has_table"] is True, "таблица не вставлена"
+    assert report["bold_action_unchecked"] is True, "кнопка не синхронизировалась"
+
+
+def test_rusify_worker_emits_signals() -> None:
+    """QThread-воркер отдаёт прогресс и результат, не блокируя поток."""
+    report = _run_gui_script(_SCRIPT_WORKER)
+
+    assert report["error"] is None, report["error"]
+    assert report["progress"] == [10, 100], report["progress"]
+    assert report["result"] is not None
+    new_text, changes = report["result"]
+    assert new_text == "the обратная связь is clear"
+    assert changes and changes[0]["original"] == "feedback"
+    assert report["thread_finished"] is True
+
+
+def test_replacements_dialog_and_apply() -> None:
+    """Диалог показывает замены, галочки снимаются, текст применяется."""
+    report = _run_gui_script(_SCRIPT_PREVIEW)
+
+    assert report["rows"] == 2
+    assert report["headers"] == ["Оригинал", "Замена", "Применить"]
+    assert report["selected_before"] == ["feedback", "meeting"]
+    assert report["selected_after"] == ["feedback"], "снятая галочка не учтена"
+
+    assert report["applied"] == 2
+    assert report["text_after"] == "the обратная связь and встреча are here"
+    assert report["bold_kept"] is True, "замена потеряла жирное начертание"
 
 
 def test_gui_entrypoint_imports() -> None:
