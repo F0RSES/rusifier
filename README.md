@@ -516,12 +516,17 @@ packaging/build-arch.sh
 
 | Задача | Что проверяется |
 |---|---|
-| `windows-exe` | `dist/TermRu.exe` собран, размер 40–120 МБ, `TermRu.exe --version` → код 0, конвертация фикстуры CLI-режимом создаёт файл |
+| `windows-exe` | `dist/TermRu.exe` собран, размер 40–180 МБ, `TermRu.exe --version` → код 0, конвертация фикстуры CLI-режимом создаёт файл |
 | `linux-deb` | `dist/termru_*.deb` собирается (`packaging/build-deb.sh`), `tests/test_deb_desktop.sh`, GUI поднимается под `xvfb-run -a /opt/termru/TermRu --gui-smoke`, `termru-cli --dry-run --json` даёт отчёт, размер пакета ≤ 100 МиБ |
 
 GUI-проверка в Linux-job требует виртуального дисплея — в job ставится `xvfb`
 и библиотеки xcb/EGL. Флаг `--gui-smoke` поднимает окно, проверяет, что в нём три
 вкладки, и сразу выходит с кодом 0 — без ожидания действий пользователя.
+
+Верхняя граница для Windows выше, чем для `.deb`: `--onefile` упаковывает весь Qt
+в один самодостаточный файл, и обрезка плагинов (`packaging/trim_bundle.py`)
+применима только к каталогу — поэтому лимит 100 МиБ относится к Linux-установщику,
+а `TermRu.exe` проверяется на разумность (40–180 МБ).
 
 Windows `.exe` **нельзя собрать на Linux**: PyInstaller не поддерживает
 кросс-компиляцию, и unifypy для цели `exe` просто вызывает PyInstaller, который

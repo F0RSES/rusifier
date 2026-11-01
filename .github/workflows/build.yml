@@ -85,11 +85,13 @@ jobs:
 
           # Размер: GUI-сборка с Qt весит десятки мегабайт; слишком маленький
           # exe означает, что Qt не попал в бандл, слишком большой — что
-          # exclude_module в unifypy.json перестал работать.
+          # exclude_module в unifypy.json перестал работать. Верхняя граница
+          # выше, чем у .deb: onefile упаковывает весь Qt в один файл, и
+          # обрезка плагинов (packaging/trim_bundle.py) к нему не применима.
           $sizeMb = [math]::Round((Get-Item $exe).Length / 1MB)
           Write-Host "TermRu.exe: $sizeMb МБ"
           if ($sizeMb -lt 40) { throw "exe слишком мал ($sizeMb МБ): Qt/PySide6 не в бандле" }
-          if ($sizeMb -gt 120) { throw "exe слишком велик ($sizeMb МБ): проверьте exclude_module" }
+          if ($sizeMb -gt 180) { throw "exe слишком велик ($sizeMb МБ): проверьте exclude_module" }
 
           if (-not (Test-Path tests\fixtures\sample.docx)) {
             throw "Фикстура tests\fixtures\sample.docx отсутствует"
