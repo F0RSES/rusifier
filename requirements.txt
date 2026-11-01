@@ -11,4 +11,5 @@ PySide6-Essentials>=6.8.0
 mammoth>=1.13.0
 html2docx>=1.6.0
 python-pptx>=1.0.0
+pymupdf>=1.24.0
 qdarkstyle>=3.2.0
