@@ -244,15 +244,41 @@ def test_use_llm_records_llm_changes(
 def test_llm_broken_markup_falls_back_to_single_blocks(
     docx_copy: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Если модель сломала маркеры, блоки обрабатываются поштучно."""
+    """Если модель сломала маркеры в многоблочном батче, блоки идут поштучно."""
     fake = _FakeLLMClient(keep_markers=False)
     monkeypatch.setattr("src.cli.DeepSeekClient", lambda **_: fake)
 
-    code, out, _ = _run(["--input", str(docx_copy), "--dry-run", "--use-llm"], capsys)
+    code, out, err = _run(
+        ["--input", str(docx_copy), "--dry-run", "--use-llm", "--batch-size", "2"],
+        capsys,
+    )
 
     report = json.loads(out)
     assert code == EXIT_OK
     assert any("разметка" in warning for warning in report["warnings"])
+    assert report["llm_replacements"] > 0
+    # Fallback сработал штатно — в stderr это INFO, а не WARNING.
+    assert "WARNING" not in err or "разметк" not in err
+
+
+def test_single_block_batches_send_no_markers(
+    docx_copy: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Батч из одного блока не просит маркеры и не пишет про них предупреждений."""
+    fake = _FakeLLMClient()
+    monkeypatch.setattr("src.cli.DeepSeekClient", lambda **_: fake)
+
+    code, out, err = _run(
+        ["--input", str(docx_copy), "--dry-run", "--use-llm", "--batch-size", "1"],
+        capsys,
+    )
+
+    report = json.loads(out)
+    assert code == EXIT_OK
+    assert fake.calls, "запросы должны быть"
+    assert all("<<<TERMRU:" not in call for call in fake.calls), fake.calls
+    assert not any("разметка" in warning for warning in report["warnings"]), report["warnings"]
+    assert "не удалось разбить ответ по маркерам" not in err
     assert report["llm_replacements"] > 0
 
 

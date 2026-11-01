@@ -585,9 +585,13 @@ def _run_llm_batches(
 ) -> tuple[list[dict], list[str]]:
     """Обработать очередь блоков через LLM батчами, сохраняя порядок.
 
-    Блоки склеиваются маркерами ``<<<TERMRU:N>>>``. Если модель нарушила
-    разметку (маркеров не столько, сколько блоков), батч дообрабатывается по
-    одному блоку — это дороже, но не теряет результат.
+    Одиночный блок отправляется **без** маркеров ``<<<TERMRU:N>>>``: ответ
+    модели — это и есть исправленный текст блока, разбирать нечего (маркеры на
+    одном блоке только провоцировали ложное «нарушена разметка»).
+
+    Несколько блоков склеиваются маркерами. Если модель нарушила разметку,
+    батч дообрабатывается по одному блоку — это дороже, но не теряет результат;
+    событие пишется в INFO, потому что fallback сработал штатно.
 
     Args:
         client: Клиент DeepSeek.
@@ -613,9 +617,13 @@ def _run_llm_batches(
         batch_texts = [texts[block_id] for block_id in batch]
         LOGGER.debug("LLM-батч %s: блоки %s", batch_index, batch)
 
+        # Одиночный блок: маркеры не нужны, ответ берётся целиком.
+        single_block = len(batch) == 1
+        payload = batch_texts[0] if single_block else _join_blocks(batch_texts)
+
         raw = _request_llm(
             client,
-            _join_blocks(batch_texts),
+            payload,
             glossary_mapping,
             exceptions_mapping,
             block_id=",".join(str(block_id) for block_id in batch),
@@ -627,13 +635,17 @@ def _run_llm_batches(
             )
             continue
 
+        if single_block:
+            _record_llm_change(changes, warnings, batch[0], batch_texts[0], raw, texts)
+            continue
+
         parts = _split_blocks(raw, len(batch))
         if parts is None:
             warnings.append(
                 f"батч {batch_index}: нарушена разметка ответа, "
                 "обрабатываю по одному блоку"
             )
-            LOGGER.warning(
+            LOGGER.info(
                 "Батч %s: не удалось разбить ответ по маркерам, обрабатываю поштучно",
                 batch_index,
             )
