@@ -211,6 +211,26 @@ def test_project_data_files_work() -> None:
     assert len(changes) == 2
 
 
+def test_composite_term_milestone_owner_replaced_whole() -> None:
+    """Составной термин «milestone owner» заменяется целиком, а не по частям."""
+    manager = GlossaryManager(
+        str(PROJECT_ROOT / "data" / "glossary.json"),
+        str(PROJECT_ROOT / "data" / "exceptions.json"),
+    )
+    engine = ReplacementEngine(manager)
+
+    new_text, changes = engine.replace_dict_only("milestone owner")
+
+    assert new_text == "владелец контрольной точки"
+    assert len(changes) == 1, changes
+    assert changes[0]["original"] == "milestone owner"
+    assert changes[0]["replacement"] == "владелец контрольной точки"
+
+    # Отдельные термины не потеряны — для других контекстов.
+    assert engine.replace_dict_only("milestone")[0] == "контрольная точка"
+    assert engine.replace_dict_only("owner")[0] == "владелец"
+
+
 def test_empty_text_and_type_errors(engine: ReplacementEngine) -> None:
     """Пустой текст — без изменений; не-строка — TypeError."""
     assert engine.replace_dict_only("") == ("", [])

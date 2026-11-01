@@ -450,6 +450,25 @@ def test_render_messages_system_is_stable(make_client: Callable[..., Any]) -> No
     assert first[1]["content"] != second[1]["content"]
 
 
+def test_prompt_requires_translation_with_exceptions(
+    make_client: Callable[..., Any],
+) -> None:
+    """Промпт требует переводить предложение, а не оставлять его английским."""
+    prompt = deepseek_client.DEFAULT_PROMPT_PATH.read_text(encoding="utf-8")
+
+    assert "НЕ ОСТАВЛЯЙ предложение полностью на английском" in prompt
+    assert "Переводи все остальные" in prompt
+    # Пример прямо в промпте: аббревиатура остаётся, остальное переводится.
+    assert "KPI targets are unchanged" in prompt
+    assert "Целевые показатели KPI не изменились" in prompt
+
+    client, _ = make_client([])
+    system = client._render_messages(GLOSSARY, EXCEPTIONS, "KPI targets are unchanged")[
+        0
+    ]["content"]
+    assert "НЕ ОСТАВЛЯЙ предложение полностью на английском" in system
+
+
 def test_render_messages_glossary_sorted(make_client: Callable[..., Any]) -> None:
     """Ключи глоссария в system отсортированы (иначе кэш не сработает)."""
     client, _ = make_client([])
