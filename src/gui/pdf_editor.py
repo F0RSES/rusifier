@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..document_processor import PDF_OWN_FONT_PREFIXES, DocumentProcessor
+from ..pdf_fonts import FONT_SUBSTITUTION_MODES
 
 #: Подпись вкладки в главном окне (используется и в тестах).
 TAB_TITLE = "PDF"
@@ -91,12 +92,15 @@ class PdfEditor(QWidget):
         self,
         parent: QWidget | None = None,
         processor: DocumentProcessor | None = None,
+        font_mode: str = FONT_SUBSTITUTION_MODE,
     ) -> None:
         """Собрать пустой редактор PDF.
 
         Args:
             parent: Родительский виджет Qt.
             processor: Процессор документов (в тестах можно передать двойник).
+            font_mode: Режим подмены шрифта из настроек (``strict``/``base14``/
+                ``always``); неизвестное значение заменяется на ``always``.
 
         Returns:
             None
@@ -105,8 +109,12 @@ class PdfEditor(QWidget):
             Ничего не бросает.
         """
         super().__init__(parent)
+        self._font_mode = (
+            font_mode if font_mode in FONT_SUBSTITUTION_MODES else FONT_SUBSTITUTION_MODE
+        )
+        self._external_processor = processor is not None
         self.processor = processor or DocumentProcessor(
-            pdf_substitute_fonts=FONT_SUBSTITUTION_MODE
+            pdf_substitute_fonts=self._font_mode
         )
         #: Открытый через PyMuPDF документ (``None`` — файл не загружен).
         self._document: Any = None
@@ -182,6 +190,40 @@ class PdfEditor(QWidget):
 
         self._show_blocks_hint(NO_DOCUMENT_TEXT)
         self._show_page_hint(NO_DOCUMENT_TEXT)
+
+    # -- настройки -----------------------------------------------------------
+    def font_substitution_mode(self) -> str:
+        """Текущий режим подмены шрифта при записи PDF.
+
+        Returns:
+            str: ``strict``, ``base14`` или ``always``.
+
+        Raises:
+            Ничего не бросает.
+        """
+        return self._font_mode
+
+    def set_font_substitution_mode(self, mode: str) -> None:
+        """Сменить режим подмены шрифта (значение из настроек).
+
+        Процессор пересоздаётся только если его создал сам редактор: двойник,
+        переданный в тестах, не подменяется.
+
+        Args:
+            mode: ``strict``, ``base14`` или ``always``.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        normalized = mode if mode in FONT_SUBSTITUTION_MODES else FONT_SUBSTITUTION_MODE
+        if normalized == self._font_mode:
+            return
+        self._font_mode = normalized
+        if not self._external_processor:
+            self.processor = DocumentProcessor(pdf_substitute_fonts=normalized)
 
     # -- файлы ---------------------------------------------------------------
     def load_file(self, filepath: str) -> bool:

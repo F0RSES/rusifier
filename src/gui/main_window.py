@@ -35,13 +35,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..glossary_manager import GlossaryError, GlossaryManager
 from .docx_editor import DocxEditor
+from .glossary_editor import GlossaryEditorDialog
 from .pdf_editor import TAB_TITLE as PDF_TAB_TITLE
 from .pdf_editor import PdfEditor
 from .pptx_editor import TAB_TITLE as PPTX_TAB_TITLE
 from .pptx_editor import PptxEditor
-from .rusify import ReplacementsDialog, RusifyWorker
-from .settings import SettingsDialog, load_settings
+from .rusify import (
+    DEFAULT_EXCEPTIONS,
+    DEFAULT_GLOSSARY,
+    ReplacementsDialog,
+    RusifyWorker,
+)
+from .settings import SettingsDialog, apply_theme, load_settings
 
 APP_TITLE = "TermRu — Редактор документов"
 DOCX_FILTER = "Документы Word (*.docx)"
@@ -95,7 +102,17 @@ class MainWindow(QMainWindow):
         self.resize(1100, 760)
         self.editor = DocxEditor(self)
         self.pptx_editor = PptxEditor(self)
-        self.pdf_editor = PdfEditor(self)
+        state = load_settings()
+        self.pdf_editor = PdfEditor(self, font_mode=state["pdf_fonts"])
+        #: Проектный словарь; ``None`` — файлы недоступны (см. ``_glossary_error``).
+        self.glossary: GlossaryManager | None = None
+        self._glossary_error = ""
+        try:
+            self.glossary = GlossaryManager(
+                str(DEFAULT_GLOSSARY), str(DEFAULT_EXCEPTIONS)
+            )
+        except (GlossaryError, OSError) as exc:  # noqa: BLE001 - окно без словаря работает
+            self._glossary_error = str(exc)
 
         self.tabs = QTabWidget(self)
         self.tabs.setObjectName("documentTabs")
@@ -236,6 +253,14 @@ class MainWindow(QMainWindow):
         )
         self.action_settings.triggered.connect(self.open_settings)
 
+        self.action_glossary = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogListView),
+            "Редактор словаря…",
+            self,
+        )
+        self.action_glossary.setObjectName("actionGlossary")
+        self.action_glossary.triggered.connect(self.open_glossary_editor)
+
         self.action_about = QAction("О программе", self)
         self.action_about.triggered.connect(self.show_about)
 
@@ -276,6 +301,7 @@ class MainWindow(QMainWindow):
         paste.triggered.connect(lambda: self._dispatch_edit("paste"))
 
         tools_menu = menubar.addMenu("&Инструменты")
+        tools_menu.addAction(self.action_glossary)
         tools_menu.addAction(self.action_settings)
         tools_menu.addSeparator()
         tools_menu.addAction(self.action_russify)
@@ -909,7 +935,7 @@ class MainWindow(QMainWindow):
 
     # -- инструменты ---------------------------------------------------------
     def open_settings(self) -> None:
-        """Открыть диалог настроек DeepSeek.
+        """Открыть диалог настроек: DeepSeek, тема, режим шрифтов PDF.
 
         Returns:
             None
@@ -918,10 +944,51 @@ class MainWindow(QMainWindow):
             Ничего не бросает.
         """
         dialog = SettingsDialog(self)
-        if dialog.exec() == SettingsDialog.DialogCode.Accepted:
-            state = load_settings()
-            mode = "ИИ + словарь" if state["use_llm"] else "только словарь"
-            self.statusBar().showMessage(f"Настройки сохранены ({mode})", 4000)
+        if dialog.exec() != SettingsDialog.DialogCode.Accepted:
+            return
+
+        state = load_settings()
+        apply_theme(state["theme"])
+        self.pdf_editor.set_font_substitution_mode(state["pdf_fonts"])
+        mode = "ИИ + словарь" if state["use_llm"] else "только словарь"
+        self.statusBar().showMessage(
+            f"Настройки сохранены ({mode}, тема {state['theme']}, "
+            f"PDF {state['pdf_fonts']})",
+            5000,
+        )
+
+    def open_glossary_editor(self) -> None:
+        """Открыть редактор словаря замен и исключений.
+
+        После сохранения диалог уже перечитал файлы через
+        :meth:`GlossaryManager.reload`, поэтому новые слова работают при
+        следующей русификации без перезапуска приложения.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает: ошибки показываются диалогом.
+        """
+        if self.glossary is None:
+            QMessageBox.warning(
+                self,
+                "Редактор словаря",
+                "Словарь недоступен: "
+                + (self._glossary_error or "файлы данных не найдены"),
+            )
+            return
+
+        dialog = GlossaryEditorDialog(self.glossary, self)
+        if dialog.exec() != GlossaryEditorDialog.DialogCode.Accepted:
+            return
+
+        QMessageBox.information(self, "Редактор словаря", "Словарь обновлён")
+        self.statusBar().showMessage(
+            f"Словарь обновлён: {len(self.glossary.glossary)} терминов, "
+            f"исключений: {len(self.glossary.exceptions)}",
+            5000,
+        )
 
     def russify_document(self) -> None:
         """Запустить русификацию в фоне и показать предпросмотр замен.
@@ -970,6 +1037,7 @@ class MainWindow(QMainWindow):
             parent=self,
             use_llm=settings["use_llm"],
             api_key=settings["api_key"],
+            glossary=self.glossary,
         )
         self._worker.progress.connect(self._progress.setValue)
         self._worker.result_ready.connect(self._on_rusify_ready)

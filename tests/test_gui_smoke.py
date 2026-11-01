@@ -595,6 +595,34 @@ print(json.dumps(report, ensure_ascii=False))
 )
 
 
+def _write_glossary_files(
+    directory: Path, glossary: dict[str, str], exceptions: list[str]
+) -> tuple[Path, Path]:
+    """Создать временные ``glossary.json`` и ``exceptions.json``.
+
+    Args:
+        directory: Каталог для файлов.
+        glossary: Пары «термин → замена».
+        exceptions: Токены исключений.
+
+    Returns:
+        tuple[Path, Path]: пути к глоссарию и исключениям.
+
+    Raises:
+        Ничего не бросает.
+    """
+    glossary_path = directory / "glossary.json"
+    exceptions_path = directory / "exceptions.json"
+    glossary_path.write_text(
+        json.dumps(glossary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    exceptions_path.write_text(
+        json.dumps(dict.fromkeys(exceptions), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return glossary_path, exceptions_path
+
+
 def _write_sample_pdf(path: Path) -> None:
     """Создать двухстраничный PDF для тестов редактора.
 
@@ -871,6 +899,187 @@ print(json.dumps(report, ensure_ascii=False))
 )
 
 
+#: Проверка редактора словаря: загрузка, добавление слов, запись в JSON.
+_SCRIPT_GLOSSARY_EDITOR = (
+    _SCRIPT_PREAMBLE
+    + """
+import json
+from pathlib import Path
+
+from src.glossary_manager import GlossaryManager
+from src.gui.glossary_editor import GlossaryEditorDialog
+import src.gui.glossary_editor as editor_module
+from src.replacement_engine import ReplacementEngine
+
+glossary_path, exceptions_path = sys.argv[1], sys.argv[2]
+
+manager = GlossaryManager(glossary_path, exceptions_path)
+dialog = GlossaryEditorDialog(manager)
+
+report["tabs"] = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
+report["glossary_headers"] = [
+    dialog.glossary_table.horizontalHeaderItem(i).text()
+    for i in range(dialog.glossary_table.columnCount())
+]
+report["exception_headers"] = [
+    dialog.exceptions_table.horizontalHeaderItem(i).text()
+    for i in range(dialog.exceptions_table.columnCount())
+]
+report["glossary_rows"] = dialog.glossary_table.rowCount()
+report["glossary_cells"] = [
+    dialog.glossary_table.item(0, 0).text(),
+    dialog.glossary_table.item(0, 1).text(),
+]
+report["exception_rows"] = dialog.exceptions_table.rowCount()
+report["counts_label"] = dialog.counts.text()
+
+# Добавляем термин и исключение, затем сохраняем.
+row = dialog.add_row(dialog.glossary_table)
+dialog.glossary_table.item(row, 0).setText("invoice")
+dialog.glossary_table.item(row, 1).setText("счёт")
+ex_row = dialog.add_row(dialog.exceptions_table)
+dialog.exceptions_table.item(ex_row, 0).setText("SKU")
+
+warnings = []
+editor_module.QMessageBox.warning = lambda *args, **kwargs: warnings.append(
+    list(args[1:3])
+)
+report["saved"] = dialog.save()
+report["dialog_result"] = dialog.result()
+report["file_glossary"] = json.loads(Path(glossary_path).read_text(encoding="utf-8"))
+report["file_exceptions"] = json.loads(Path(exceptions_path).read_text(encoding="utf-8"))
+report["tmp_left"] = sorted(
+    path.name for path in Path(glossary_path).parent.glob("*termru-tmp*")
+)
+
+# Новые слова сразу видны движку замены (reload внутри save).
+report["hit"] = dict(manager.get_replacements("the invoice is ready"))
+report["engine_text"] = ReplacementEngine(manager).replace_dict_only(
+    "Our invoice is ready"
+)[0]
+report["exception_hit"] = manager.is_exception("sku")
+
+# Дубликат (регистр не важен) сохранять нельзя: файл остаётся прежним.
+row = dialog.add_row(dialog.glossary_table)
+dialog.glossary_table.item(row, 0).setText("Invoice")
+dialog.glossary_table.item(row, 1).setText("счёт-фактура")
+report["duplicate_saved"] = dialog.save()
+report["duplicate_warning"] = warnings[0][1] if warnings else None
+report["file_after_duplicate"] = json.loads(
+    Path(glossary_path).read_text(encoding="utf-8")
+)
+
+# Удаление строки работает на выбранной таблице.
+before = dialog.glossary_table.rowCount()
+dialog.glossary_table.setCurrentCell(before - 1, 0)
+report["removed"] = dialog.remove_selected_rows(dialog.glossary_table)
+report["rows_after_remove"] = dialog.glossary_table.rowCount()
+
+dialog.close()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+#: Проверка настроек: вкладки, переключение темы и режим PDF.
+_SCRIPT_SETTINGS_THEME = (
+    _SCRIPT_PREAMBLE
+    + """
+from pathlib import Path
+
+from PySide6.QtCore import QSettings
+
+settings_dir = sys.argv[1]
+# Изолируем QSettings от реального профиля пользователя. Важно: экземпляры
+# QSettings(org, app) используют NativeFormat, поэтому подменять нужно его.
+QSettings.setPath(QSettings.Format.NativeFormat, QSettings.Scope.UserScope, settings_dir)
+
+from src.gui.settings import SettingsDialog, load_settings, stylesheet_for
+
+report["defaults"] = load_settings()
+
+dialog = SettingsDialog(
+    initial={"api_key": "", "use_llm": False, "theme": "dark", "pdf_fonts": "always"}
+)
+report["tabs"] = [dialog.tabs.tabText(i) for i in range(dialog.tabs.count())]
+report["theme_items"] = [
+    dialog.theme_combo.itemData(i) for i in range(dialog.theme_combo.count())
+]
+report["pdf_items"] = [
+    dialog.pdf_combo.itemData(i) for i in range(dialog.pdf_combo.count())
+]
+
+# Переключение темы применяется к QApplication сразу.
+dialog.theme_combo.setCurrentIndex(dialog.theme_combo.findData("light"))
+report["theme_after_switch"] = dialog.theme()
+report["style_matches_light"] = app.styleSheet() == stylesheet_for("light")
+
+dialog.pdf_combo.setCurrentIndex(dialog.pdf_combo.findData("strict"))
+report["pdf_mode"] = dialog.pdf_font_mode()
+
+dialog.save_and_close()
+report["dialog_result"] = dialog.result()
+report["saved"] = load_settings()
+settings_file = Path(settings_dir) / "TermRu" / "Editor.conf"
+report["settings_file"] = str(settings_file)
+report["settings_written"] = settings_file.exists()
+report["settings_text"] = (
+    settings_file.read_text(encoding="utf-8") if settings_file.exists() else ""
+)
+
+# Отмена возвращает прежнюю тему.
+dialog2 = SettingsDialog(
+    initial={"api_key": "", "use_llm": False, "theme": "light", "pdf_fonts": "strict"}
+)
+dialog2.theme_combo.setCurrentIndex(dialog2.theme_combo.findData("dark"))
+report["theme_switched_again"] = app.styleSheet() == stylesheet_for("dark")
+dialog2.reject()
+report["theme_after_reject"] = app.styleSheet() == stylesheet_for("light")
+
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка, что отредактированный словарь сразу работает в русификации.
+_SCRIPT_GLOSSARY_RUSSIFY = (
+    _SCRIPT_PREAMBLE
+    + """
+import src.gui.main_window as main_window
+from src.glossary_manager import GlossaryManager
+
+main_window.QMessageBox.information = lambda *args, **kwargs: None
+main_window.ReplacementsDialog.exec = (
+    lambda self: main_window.ReplacementsDialog.DialogCode.Rejected
+)
+
+window.glossary = GlossaryManager(sys.argv[1], sys.argv[2])
+window.editor.setPlainText("Our gadget is ready")
+report["text_before"] = window.editor.toPlainText()
+
+window.russify_document()
+report["worker_started"] = window._worker is not None
+report["worker_uses_manager"] = window._worker._glossary is window.glossary
+report["worker_text"] = window._worker._text
+window._worker.result_ready.connect(
+    lambda text, changes: report.setdefault("result", [text, len(changes)])
+)
+window._worker.wait(20000)
+for _ in range(20):
+    app.processEvents()
+
+report["text_after"] = report.get("result", [None])[0]
+
+window.editor.mark_saved()
+window.pptx_editor.mark_saved()
+window.pdf_editor.close_document()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
 def _gui_environment() -> dict[str, str]:
     """Окружение подпроцесса: offscreen и Qt-библиотеки из PySide6.
 
@@ -937,7 +1146,11 @@ def test_main_window_builds_ui() -> None:
     assert len(report["menus"]) == 4, report["menus"]
     assert report["toolbar_actions"] >= 3
     assert report["toolbar_count"] == 2
-    assert report["tools_menu"] == ["Настройки…", "Русифицировать документ"], report["tools_menu"]
+    assert report["tools_menu"] == [
+        "Редактор словаря…",
+        "Настройки…",
+        "Русифицировать документ",
+    ], report["tools_menu"]
     assert report["status_path"] == "Новый документ"
     assert report["status_counts"] == "Слов: 0 · Символов: 0"
     assert report["title"].startswith("TermRu — Редактор документов")
@@ -1312,6 +1525,91 @@ def test_pdf_editor_warns_before_reprocessing(tmp_path: Path) -> None:
 
     assert report["saved_yes"] is True
     assert report["file_created_yes"] is True
+
+
+def test_glossary_editor_load_and_save(tmp_path: Path) -> None:
+    """Диалог словаря читает JSON, добавляет слова, пишет файлы и делает reload."""
+    glossary_path, exceptions_path = _write_glossary_files(
+        tmp_path, {"feedback": "обратная связь"}, ["API"]
+    )
+    report = _run_gui_script(
+        _SCRIPT_GLOSSARY_EDITOR, str(glossary_path), str(exceptions_path)
+    )
+
+    assert report["tabs"] == ["Словарь", "Исключения"]
+    assert report["glossary_headers"] == ["Английский", "Русский"]
+    assert report["exception_headers"] == ["Слово / Аббревиатура"]
+    assert report["glossary_rows"] == 1
+    assert report["glossary_cells"] == ["feedback", "обратная связь"]
+    assert report["exception_rows"] == 1
+    assert report["counts_label"] == "Терминов: 1 · исключений: 1"
+
+    assert report["saved"] is True
+    assert report["dialog_result"] == 1, "диалог не закрылся с Accepted"
+    assert report["file_glossary"] == {
+        "feedback": "обратная связь",
+        "invoice": "счёт",
+    }, report["file_glossary"]
+    assert report["file_exceptions"] == {"API": None, "SKU": None}
+    assert report["tmp_left"] == [], report["tmp_left"]
+
+    # Новое слово сразу работает: менеджер перечитан внутри save().
+    assert report["hit"] == {"invoice": "счёт"}
+    assert report["engine_text"] == "Our счёт is ready"
+    assert report["exception_hit"] is True
+
+    # Дубликат (регистр не важен) не пишется в файл.
+    assert report["duplicate_saved"] is False
+    assert "повторяется" in (report["duplicate_warning"] or "")
+    assert "Invoice" not in report["file_after_duplicate"]
+
+    assert report["removed"] == 1
+    assert report["rows_after_remove"] == 2
+
+
+def test_settings_theme_change(tmp_path: Path) -> None:
+    """Тема переключается и сохраняется в QSettings, режим PDF тоже."""
+    report = _run_gui_script(_SCRIPT_SETTINGS_THEME, str(tmp_path))
+
+    assert report["tabs"] == ["DeepSeek", "Внешний вид", "PDF"]
+    assert report["theme_items"] == ["dark", "light"]
+    assert report["pdf_items"] == ["strict", "base14", "always"]
+    assert report["defaults"]["theme"] == "dark"
+    assert report["defaults"]["pdf_fonts"] == "always"
+
+    assert report["theme_after_switch"] == "light"
+    assert report["style_matches_light"] is True, "светлая тема не применилась сразу"
+
+    assert report["pdf_mode"] == "strict"
+    assert report["dialog_result"] == 1
+
+    assert report["saved"]["theme"] == "light"
+    assert report["saved"]["pdf_fonts"] == "strict"
+    assert report["settings_written"] is True
+    assert str(tmp_path) in report["settings_file"]
+    settings_text = report["settings_text"].replace(" ", "")
+    assert "theme=light" in settings_text, settings_text
+    assert "substitute_fonts=strict" in settings_text, settings_text
+
+    # Отмена возвращает тему, которая была до открытия диалога.
+    assert report["theme_switched_again"] is True
+    assert report["theme_after_reject"] is True
+
+
+def test_russify_uses_edited_glossary(tmp_path: Path) -> None:
+    """Термин из отредактированного словаря срабатывает в русификации сразу."""
+    glossary_path, exceptions_path = _write_glossary_files(
+        tmp_path, {"gadget": "устройство"}, ["API"]
+    )
+    report = _run_gui_script(
+        _SCRIPT_GLOSSARY_RUSSIFY, str(glossary_path), str(exceptions_path)
+    )
+
+    assert report["text_before"] == "Our gadget is ready"
+    assert report["worker_started"] is True
+    assert report["worker_uses_manager"] is True, "воркер не получил словарь окна"
+    assert report["worker_text"] == "Our gadget is ready"
+    assert report["text_after"] == "Our устройство is ready", report["text_after"]
 
 
 def test_gui_entrypoint_imports() -> None:

@@ -76,6 +76,7 @@ class RusifyWorker(QThread):
         *,
         use_llm: bool = False,
         api_key: str = "",
+        glossary: GlossaryManager | None = None,
     ) -> None:
         """Создать воркер русификации.
 
@@ -85,6 +86,7 @@ class RusifyWorker(QThread):
             parent: Родительский объект Qt.
             use_llm: Дополнительно прогнать текст через DeepSeek.
             api_key: Ключ API; без него режим ИИ не включается.
+            glossary: Общий менеджер глоссария; ``None`` — перечитать файлы.
 
         Returns:
             None
@@ -94,7 +96,7 @@ class RusifyWorker(QThread):
         """
         super().__init__(parent)
         self._text = text
-        self._glossary = _default_glossary()
+        self._glossary = glossary if glossary is not None else _default_glossary()
         self._engine = engine if engine is not None else ReplacementEngine(self._glossary)
         self._use_llm = bool(use_llm) and bool(api_key.strip())
         self._api_key = api_key.strip()

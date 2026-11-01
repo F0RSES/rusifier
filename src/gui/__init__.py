@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-__all__ = ["MainWindow", "DocxEditor", "PptxEditor", "PdfEditor"]
+__all__ = ["MainWindow", "DocxEditor", "PptxEditor", "PdfEditor", "GlossaryEditorDialog"]
 
 
 def __getattr__(name: str) -> object:
@@ -16,7 +16,8 @@ def __getattr__(name: str) -> object:
         name: Имя атрибута пакета.
 
     Returns:
-        object: Класс ``MainWindow``, ``DocxEditor``, ``PptxEditor`` или ``PdfEditor``.
+        object: Класс ``MainWindow``, ``DocxEditor``, ``PptxEditor``,
+        ``PdfEditor`` или ``GlossaryEditorDialog``.
 
     Raises:
         AttributeError: для неизвестного имени.
@@ -37,4 +38,8 @@ def __getattr__(name: str) -> object:
         from .pdf_editor import PdfEditor
 
         return PdfEditor
+    if name == "GlossaryEditorDialog":
+        from .glossary_editor import GlossaryEditorDialog
+
+        return GlossaryEditorDialog
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

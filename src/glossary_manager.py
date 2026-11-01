@@ -29,7 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -151,6 +151,30 @@ class GlossaryManager:
         """
         return self._terms_by_length
 
+    @property
+    def glossary_path(self) -> Path:
+        """Путь к файлу глоссария.
+
+        Returns:
+            Path: путь, из которого читается ``glossary.json``.
+
+        Raises:
+            Ничего не бросает.
+        """
+        return self._glossary_path
+
+    @property
+    def exceptions_path(self) -> Path:
+        """Путь к файлу исключений.
+
+        Returns:
+            Path: путь, из которого читается ``exceptions.json``.
+
+        Raises:
+            Ничего не бросает.
+        """
+        return self._exceptions_path
+
 
     # -- перезагрузка --------------------------------------------------------
 
@@ -187,10 +211,118 @@ class GlossaryManager:
             f"Глоссарий: {len(glossary)} терминов, исключений: {len(exceptions)}",
         )
 
+    def save(
+        self,
+        glossary: Mapping[str, str],
+        exceptions: Iterable[str],
+    ) -> None:
+        """Записать глоссарий и исключения в файлы и перечитать их.
+
+        Данные сначала пишутся во временные файлы и проверяются теми же
+        загрузчиками, что и при старте, поэтому невалидный словарь (пустой
+        термин, термин без замены, дубликаты, различающиеся регистром) не
+        попадёт на диск. Только после успешной проверки файлы подменяются
+        атомарно, а затем вызывается :meth:`reload` — новые слова сразу видны
+        движку замены.
+
+        Args:
+            glossary: ``{термин: замена}`` в нужном порядке.
+            exceptions: Токены исключений (пустые пропускаются, дубликаты без
+                учёта регистра отбрасываются).
+
+        Returns:
+            None
+
+        Raises:
+            GlossaryError: данные не прошли валидацию; файлы остаются прежними.
+        """
+        payload_glossary = {
+            str(term).strip(): str(value).strip()
+            for term, value in glossary.items()
+            if str(term).strip()
+        }
+        payload_exceptions: dict[str, None] = {}
+        for token in exceptions:
+            text = str(token).strip()
+            if not text:
+                continue
+            payload_exceptions.setdefault(text, None)
+
+        glossary_tmp = self._temp_path(self._glossary_path)
+        exceptions_tmp = self._temp_path(self._exceptions_path)
+        tmp_paths = (glossary_tmp, exceptions_tmp)
+        try:
+            self._write_json(glossary_tmp, payload_glossary)
+            self._write_json(exceptions_tmp, payload_exceptions)
+            # Валидация теми же загрузчиками, что и при старте приложения.
+            self._load_glossary(glossary_tmp)
+            self._load_exceptions(exceptions_tmp)
+        except Exception:
+            for path in tmp_paths:
+                path.unlink(missing_ok=True)
+            raise
+
+        previous_glossary = dict(self._glossary)
+        previous_exceptions = tuple(self._exceptions)
+        glossary_tmp.replace(self._glossary_path)
+        exceptions_tmp.replace(self._exceptions_path)
+        try:
+            self.reload()
+        except GlossaryError:
+            self._write_json(self._glossary_path, previous_glossary)
+            self._write_json(
+                self._exceptions_path, dict.fromkeys(previous_exceptions, None)
+            )
+            raise
+
+        self._log(
+            "info",
+            f"Словарь сохранён: {len(self._glossary)} терминов, "
+            f"исключений: {len(self._exceptions)}",
+        )
+
+    @staticmethod
+    def _temp_path(path: Path) -> Path:
+        """Имя временного файла рядом с целевым.
+
+        Args:
+            path: Целевой файл.
+
+        Returns:
+            Path: путь вида ``.<имя>.termru-tmp.json`` (та же файловая система,
+            поэтому подмена атомарна).
+
+        Raises:
+            Ничего не бросает.
+        """
+        return path.with_name(f".{path.name}.termru-tmp")
+
+    @staticmethod
+    def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+        """Записать JSON-объект с отступами и переводом строки в конце.
+
+        Args:
+            path: Куда писать.
+            payload: Данные (плоский объект).
+
+        Returns:
+            None
+
+        Raises:
+            OSError: каталог недоступен для записи.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(dict(payload), ensure_ascii=False, indent=2)
+        path.write_text(text + "\n", encoding="utf-8")
+
     # -- загрузка ------------------------------------------------------------
 
-    def _load_glossary(self) -> dict[str, str]:
+    def _load_glossary(self, path: Path | None = None) -> dict[str, str]:
         """Прочитать и провалидировать глоссарий.
+
+        Args:
+            path: Файл для чтения; ``None`` — файл этого менеджера (при
+                сохранении валидируется временный файл).
 
         Returns:
             dict[str, str]: ``{термин: замена}`` без лишних пробелов по краям.
@@ -199,25 +331,26 @@ class GlossaryManager:
             GlossaryError: файл некорректен или нарушает схему (пустой термин,
                 нестроковая/пустая замена, термины, различающиеся только регистром).
         """
-        data = self._read_json(self._glossary_path)
-        raw = self._flatten_glossary(data, self._glossary_path)
+        source = path if path is not None else self._glossary_path
+        data = self._read_json(source)
+        raw = self._flatten_glossary(data, source)
 
         glossary: dict[str, str] = {}
         seen: dict[str, str] = {}
         for term, value in raw.items():
             if not isinstance(term, str) or not term.strip():
-                raise GlossaryError(f"Пустой или нестроковый термин: {term!r}", self._glossary_path)
+                raise GlossaryError(f"Пустой или нестроковый термин: {term!r}", source)
             if not isinstance(value, str) or not value.strip():
                 raise GlossaryError(
                     f"Замена для термина {term!r} должна быть непустой строкой",
-                    self._glossary_path,
+                    source,
                 )
             clean_term = term.strip()
             key = clean_term.lower()
             if key in seen:
                 raise GlossaryError(
                     f"Термины {seen[key]!r} и {clean_term!r} различаются только регистром",
-                    self._glossary_path,
+                    source,
                 )
             seen[key] = clean_term
             if not self._has_word_edges(clean_term):
@@ -229,8 +362,11 @@ class GlossaryManager:
             glossary[clean_term] = value.strip()
         return glossary
 
-    def _load_exceptions(self) -> dict[str, None]:
+    def _load_exceptions(self, path: Path | None = None) -> dict[str, None]:
         """Прочитать список исключений (значения игнорируются).
+
+        Args:
+            path: Файл для чтения; ``None`` — файл этого менеджера.
 
         Returns:
             dict[str, None]: исключения в исходном написании.
@@ -238,8 +374,9 @@ class GlossaryManager:
         Raises:
             GlossaryError: файл некорректен или содержит пустой/нестроковый токен.
         """
-        data = self._read_json(self._exceptions_path)
-        tokens = self._flatten_exceptions(data, self._exceptions_path)
+        source = path if path is not None else self._exceptions_path
+        data = self._read_json(source)
+        tokens = self._flatten_exceptions(data, source)
 
         exceptions: dict[str, None] = {}
         seen: dict[str, str] = {}
@@ -247,7 +384,7 @@ class GlossaryManager:
             if not isinstance(token, str) or not token.strip():
                 raise GlossaryError(
                     f"Пустой или нестроковый токен исключения: {token!r}",
-                    self._exceptions_path,
+                    source,
                 )
             clean = token.strip()
             key = clean.lower()
