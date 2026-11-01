@@ -5,10 +5,15 @@ name: build
 # Windows .exe нельзя собрать на Linux (PyInstaller не кросс-компилирует),
 # поэтому .exe делается на windows-latest, а .deb — на ubuntu-22.04
 # (glibc 2.35 → пакет запускается на Ubuntu 22.04+ и Debian 12+).
+#
+# Запуск: пуш в main, теги v*, pull request в main, ручной workflow_dispatch.
 
 on:
   push:
-    tags: ["v*"]
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
