@@ -19,6 +19,11 @@ on:
 jobs:
   windows-exe:
     runs-on: windows-latest
+    # unifypy печатает Unicode (китайские сообщения, эмодзи): на раннере stdout
+    # по умолчанию cp1252, и печать падает без внятного трейсбека.
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -52,18 +57,28 @@ jobs:
       # --skip-installer: установщик Inno Setup на раннере не нужен и не соберётся.
       # strip на Windows не передаётся: unifypy не имеет CLI-флага --strip, а в
       # общем unifypy.json его нет — Linux включает его через build-deb.sh.
-      # --verbose: полный лог PyInstaller сразу пишется в unifypy-build.log.
+      - name: Debug unifypy
+        shell: bash
+        run: |
+          python --version
+          python -c "import sys, platform; print('stdout encoding:', sys.stdout.encoding); print('platform:', platform.system(), platform.release())"
+          python -c "import PIL; print('Pillow:', PIL.__version__)"
+          pip list
+          python -c "import unifypy; print('unifypy imported')"
+          python -m unifypy --help
+          cat unifypy.json
+      # Первая попытка — прямой вывод в консоль (без tee), чтобы трейсбек был
+      # виден в логе job. При падении повтор пишется в файл для артефакта.
       - name: Build exe
         shell: bash
         run: |
-          set -o pipefail
           python -m unifypy . --config unifypy.json --format exe --onefile \
-            --skip-installer --clean --verbose 2>&1 | tee unifypy-build.log
-          status=${PIPESTATUS[0]}
+            --skip-installer --clean --verbose
+          status=$?
           if [ "$status" -ne 0 ]; then
-            echo "::error::unifypy упал (exit $status), повтор без кэша"
+            echo "::error::unifypy упал (exit $status), повтор с логом в файл"
             python -m unifypy . --config unifypy.json --format exe --onefile \
-              --skip-installer --clean 2>&1 | tee -a unifypy-build.log
+              --skip-installer --clean --verbose 2>&1 | tee unifypy-build.log
             status=${PIPESTATUS[0]}
           fi
           exit "$status"
