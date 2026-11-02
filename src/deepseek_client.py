@@ -631,6 +631,15 @@ class DeepSeekClient:
                 )
             except openai.APIError as exc:
                 last_error = exc
+                # Лог в stderr: без него сбой запроса виден только как «ничего
+                # не произошло» — GUI не имеет своего консольного вывода.
+                LOGGER.error(
+                    "DeepSeek API: %s (попытка %d/%d): %s",
+                    type(exc).__name__,
+                    attempt,
+                    attempts,
+                    exc,
+                )
                 if attempt >= attempts:
                     break
                 self._log(
@@ -644,6 +653,7 @@ class DeepSeekClient:
                 delay *= 2
                 continue
             except Exception as exc:  # noqa: BLE001 - границы модуля
+                LOGGER.exception("DeepSeek: непредвиденная ошибка запроса")
                 raise DeepSeekAPIError(
                     f"Неожиданная ошибка при запросе к DeepSeek: {exc}"
                 ) from exc
@@ -651,6 +661,12 @@ class DeepSeekClient:
             self._log_usage(response, log_callback)
             return self._extract_content(response)
 
+        LOGGER.error(
+            "DeepSeek API недоступен после %d попыток: %s",
+            attempts,
+            last_error,
+            exc_info=last_error,
+        )
         raise DeepSeekAPIError(
             f"DeepSeek API недоступен после {attempts} попыток: {last_error}",
             attempts=attempts,
