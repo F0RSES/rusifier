@@ -1023,12 +1023,22 @@ class MainWindow(QMainWindow):
         settings = load_settings()
         self._rusify_cancelled = False
         self._rusify_target = kind
-        self._progress = QProgressDialog("Идёт анализ документа…", "Отмена", 0, 100, self)
-        self._progress.setWindowTitle("Русификация")
-        self._progress.setWindowModality(Qt.WindowModality.WindowModal)
-        self._progress.setMinimumDuration(0)
-        self._progress.setValue(0)
-        self._progress.canceled.connect(self._cancel_rusify)
+        # Диалог живёт в атрибуте окна: иначе Python соберёт его сборщиком
+        # мусора, и прогресс-бар исчезнет до окончания работы воркера.
+        self.progress_dialog = QProgressDialog(
+            "Идёт анализ документа…", "Отмена", 0, 100, self
+        )
+        self.progress_dialog.setWindowTitle("Русификация")
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setMinimumDuration(0)
+        # autoClose/autoReset выключены: иначе setValue(100) сам вызывает
+        # cancel(), сигнал canceled помечает прогон отменённым, и результат
+        # воркера молча отбрасывается. Закрываем диалог только мы.
+        self.progress_dialog.setAutoClose(False)
+        self.progress_dialog.setAutoReset(False)
+        self.progress_dialog.setValue(0)
+        self.progress_dialog.show()
+        self.progress_dialog.canceled.connect(self._cancel_rusify)
 
         self._set_surface_read_only(True)
 
@@ -1039,7 +1049,7 @@ class MainWindow(QMainWindow):
             api_key=settings["api_key"],
             glossary=self.glossary,
         )
-        self._worker.progress.connect(self._progress.setValue)
+        self._worker.progress.connect(self.progress_dialog.setValue)
         self._worker.result_ready.connect(self._on_rusify_ready)
         self._worker.failed.connect(self._on_rusify_failed)
         self._worker.finished.connect(self._on_rusify_finished)
@@ -1128,6 +1138,7 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
+        self._close_progress()
         self._set_surface_read_only(False)
 
     def _set_surface_read_only(self, read_only: bool) -> None:
@@ -1153,17 +1164,25 @@ class MainWindow(QMainWindow):
     def _close_progress(self) -> None:
         """Закрыть и уничтожить прогресс-диалог, если он открыт.
 
+        Сначала отключается ``canceled``: ``QProgressDialog`` считает закрытие
+        отменой, а нам важно не пометить успешный прогон как отменённый.
+
         Returns:
             None
 
         Raises:
             Ничего не бросает.
         """
-        progress = getattr(self, "_progress", None)
-        if progress is not None:
-            progress.close()
-            progress.deleteLater()
-            self._progress = None
+        progress = getattr(self, "progress_dialog", None)
+        if progress is None:
+            return
+        try:
+            progress.canceled.disconnect(self._cancel_rusify)
+        except (RuntimeError, TypeError):
+            pass
+        self.progress_dialog = None
+        progress.close()
+        progress.deleteLater()
 
     def apply_replacements(self, pairs: Sequence[tuple[str, str]]) -> int:
         """Заменить фрагменты в редакторе, сохраняя форматирование.

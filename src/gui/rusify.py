@@ -8,7 +8,9 @@
 from __future__ import annotations
 
 import difflib
+import logging
 import re
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,10 @@ from ..replacement_engine import ReplacementEngine
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_GLOSSARY = PROJECT_ROOT / "data" / "glossary.json"
 DEFAULT_EXCEPTIONS = PROJECT_ROOT / "data" / "exceptions.json"
+
+#: Логгер воркера: сообщения видны в терминале даже без настройки logging
+#: (root-логгер с lastResort-обработчиком печатает WARNING и выше в stderr).
+LOGGER = logging.getLogger(__name__)
 
 #: Сколько символов отправлять в одном запросе к LLM.
 LLM_BATCH_CHARS = 1500
@@ -105,8 +111,9 @@ class RusifyWorker(QThread):
         """Выполнить замены и отправить результат сигналом.
 
         Сначала идёт словарный проход, затем (если включён ИИ) — батчи в DeepSeek
-        с построением diff-пар. Ошибки API превращаются в сигнал ``failed``,
-        поэтому приложение не падает даже без интернета.
+        с построением diff-пар. Любая ошибка превращается в сигнал ``failed``,
+        а трейсбек печатается в stderr: ``QThread`` иначе «проглатывает»
+        исключение, и пользователь видит только мигнувший прогресс-бар.
 
         Returns:
             None
@@ -115,18 +122,31 @@ class RusifyWorker(QThread):
             Ничего не бросает: исключение превращается в сигнал ``failed``.
         """
         try:
+            LOGGER.info("Начало словарной замены")
             self.progress.emit(10)
             text_after_dict, changes = self._engine.replace_dict_only(self._text)
             self.progress.emit(40)
+
             if self._use_llm:
+                LOGGER.info("Отправка запроса в DeepSeek...")
                 text_after_dict, llm_changes = self._apply_llm(text_after_dict)
+                LOGGER.info(
+                    "Ответ от DeepSeek получен, символов: %d", len(text_after_dict)
+                )
                 changes = list(changes) + llm_changes
+
             self.progress.emit(100)
             self.result_ready.emit(text_after_dict, list(changes))
         except DeepSeekError as exc:
+            # Ожидаемая ошибка API: трейсбек нужен для диагностики, но
+            # сообщение пользователю остаётся коротким.
+            traceback.print_exc()
+            LOGGER.error("DeepSeek: %s", exc)
             self.failed.emit(f"Ошибка API: {exc}")
         except Exception as exc:  # noqa: BLE001 - поток не должен падать молча
-            self.failed.emit(str(exc))
+            traceback.print_exc()
+            LOGGER.exception("Русификация упала")
+            self.failed.emit(f"Критическая ошибка: {exc}")
 
     def _apply_llm(self, text: str) -> tuple[str, list[dict]]:
         """Прогнать текст через DeepSeek батчами и построить diff-пары.

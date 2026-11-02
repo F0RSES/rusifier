@@ -1080,6 +1080,144 @@ print(json.dumps(report, ensure_ascii=False))
 )
 
 
+#: Регрессия: результат русификации не должен отбрасываться как «отмена».
+_SCRIPT_RUSIFY_PREVIEW = (
+    _SCRIPT_PREAMBLE
+    + """
+import src.gui.main_window as main_window
+
+messages = []
+main_window.QMessageBox.information = lambda *a, **k: messages.append(list(a[1:3]))
+main_window.QMessageBox.critical = lambda *a, **k: messages.append(list(a[1:3]))
+main_window.load_settings = lambda: {
+    "api_key": "", "use_llm": False, "theme": "dark", "pdf_fonts": "always"
+}
+
+dialogs = []
+
+
+class SpyDialog(main_window.ReplacementsDialog):
+    def __init__(self, items, parent=None):
+        dialogs.append(len(items))
+        super().__init__(items, parent)
+
+    def exec(self):
+        return main_window.ReplacementsDialog.DialogCode.Rejected
+
+
+main_window.ReplacementsDialog = SpyDialog
+
+window.editor.setPlainText("The feedback from the meeting is below")
+window.russify_document()
+report["progress_created"] = window.progress_dialog is not None
+report["auto_close"] = window.progress_dialog.autoClose() if window.progress_dialog else None
+report["auto_reset"] = window.progress_dialog.autoReset() if window.progress_dialog else None
+
+for _ in range(400):
+    app.processEvents()
+window._worker.wait(20000)
+for _ in range(400):
+    app.processEvents()
+
+report["cancelled"] = window._rusify_cancelled
+report["progress_closed"] = window.progress_dialog is None
+report["dialogs"] = dialogs
+report["messages"] = messages
+report["editor_unlocked"] = not window.editor.isReadOnly()
+
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Ошибка DeepSeek: окно с ошибкой + трейсбек в stderr, прогресс закрыт.
+_SCRIPT_RUSIFY_API_ERROR = (
+    _SCRIPT_PREAMBLE
+    + """
+import src.gui.main_window as main_window
+import src.gui.rusify as rusify_module
+from src.deepseek_client import DeepSeekAPIError
+
+messages = []
+main_window.QMessageBox.information = lambda *a, **k: messages.append(list(a[1:3]))
+main_window.QMessageBox.critical = lambda *a, **k: messages.append(list(a[1:3]))
+main_window.load_settings = lambda: {
+    "api_key": "sk-test", "use_llm": True, "theme": "dark", "pdf_fonts": "always"
+}
+
+
+class FailingClient:
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def replace_text(self, *args, **kwargs):
+        raise DeepSeekAPIError("DeepSeek API недоступен после 3 попыток: boom")
+
+
+rusify_module.DeepSeekClient = FailingClient
+
+window.editor.setPlainText("The feedback from the meeting is below")
+window.russify_document()
+for _ in range(400):
+    app.processEvents()
+window._worker.wait(20000)
+for _ in range(400):
+    app.processEvents()
+
+report["cancelled"] = window._rusify_cancelled
+report["progress_closed"] = window.progress_dialog is None
+report["messages"] = messages
+report["editor_unlocked"] = not window.editor.isReadOnly()
+
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Неожиданное падение внутри потока: «Критическая ошибка» + трейсбек.
+_SCRIPT_RUSIFY_CRASH = (
+    _SCRIPT_PREAMBLE
+    + """
+import src.gui.main_window as main_window
+import src.gui.rusify as rusify_module
+
+messages = []
+main_window.QMessageBox.information = lambda *a, **k: messages.append(list(a[1:3]))
+main_window.QMessageBox.critical = lambda *a, **k: messages.append(list(a[1:3]))
+main_window.load_settings = lambda: {
+    "api_key": "", "use_llm": False, "theme": "dark", "pdf_fonts": "always"
+}
+
+
+class BrokenEngine:
+    def replace_dict_only(self, text):
+        raise RuntimeError("движок сломался")
+
+
+rusify_module.ReplacementEngine = lambda glossary: BrokenEngine()
+
+window.editor.setPlainText("The feedback from the meeting is below")
+window.russify_document()
+for _ in range(400):
+    app.processEvents()
+window._worker.wait(20000)
+for _ in range(400):
+    app.processEvents()
+
+report["cancelled"] = window._rusify_cancelled
+report["progress_closed"] = window.progress_dialog is None
+report["messages"] = messages
+report["editor_unlocked"] = not window.editor.isReadOnly()
+
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
 def _gui_environment() -> dict[str, str]:
     """Окружение подпроцесса: offscreen и Qt-библиотеки из PySide6.
 
@@ -1103,15 +1241,15 @@ def _gui_environment() -> dict[str, str]:
     return env
 
 
-def _run_gui_script(script: str, *args: str) -> dict:
-    """Выполнить пробу в подпроцессе и вернуть её JSON-отчёт.
+def _run_gui_script_capture(script: str, *args: str) -> tuple[dict, str]:
+    """Выполнить пробу в подпроцессе и вернуть JSON-отчёт вместе со stderr.
 
     Args:
         script: Текст скрипта (``python -c``).
         *args: Аргументы скрипта.
 
     Returns:
-        dict: Разобранный JSON.
+        tuple[dict, str]: разобранный JSON и stderr подпроцесса.
 
     Raises:
         AssertionError: если подпроцесс упал или не вернул JSON.
@@ -1127,7 +1265,24 @@ def _run_gui_script(script: str, *args: str) -> dict:
     assert completed.returncode == 0, completed.stderr[-3000:]
     lines = [line for line in completed.stdout.splitlines() if line.strip()]
     assert lines, completed.stdout
-    return json.loads(lines[-1])
+    return json.loads(lines[-1]), completed.stderr
+
+
+def _run_gui_script(script: str, *args: str) -> dict:
+    """Выполнить пробу в подпроцессе и вернуть её JSON-отчёт.
+
+    Args:
+        script: Текст скрипта (``python -c``).
+        *args: Аргументы скрипта.
+
+    Returns:
+        dict: Разобранный JSON.
+
+    Raises:
+        AssertionError: если подпроцесс упал или не вернул JSON.
+    """
+    report, _ = _run_gui_script_capture(script, *args)
+    return report
 
 
 def test_main_window_builds_ui() -> None:
@@ -1697,6 +1852,59 @@ def test_unifypy_config_builds_gui() -> None:
     assert "fitz" in excludes
     assert "pypdfium2" not in excludes
     assert "pypdfium2_raw" not in excludes
+
+
+def test_rusify_preview_is_shown() -> None:
+    """Успешный прогон доходит до диалога замен, а не «отменяется» прогрессом.
+
+    Регрессия: ``QProgressDialog`` с включённым ``autoClose`` вызывает
+    ``cancel()`` на ``setValue(100)``, сигнал ``canceled`` помечал прогон
+    отменённым, и результат воркера молча отбрасывался.
+    """
+    report = _run_gui_script(_SCRIPT_RUSIFY_PREVIEW)
+
+    assert report["progress_created"] is True, "прогресс-диалог не создан"
+    assert report["auto_close"] is False, "autoClose снова включён"
+    assert report["auto_reset"] is False, "autoReset снова включён"
+
+    assert report["cancelled"] is False, "результат помечен как отменённый"
+    assert report["progress_closed"] is True, "прогресс-диалог не закрыт"
+    assert report["dialogs"] == [2], report["dialogs"]  # feedback + meeting
+    assert report["messages"] == [], report["messages"]
+    assert report["editor_unlocked"] is True
+
+
+def test_rusify_api_error_shows_dialog_and_traceback() -> None:
+    """Ошибка DeepSeek: окно с ошибкой, трейсбек в stderr, прогресс закрыт."""
+    report, stderr = _run_gui_script_capture(_SCRIPT_RUSIFY_API_ERROR)
+
+    assert report["cancelled"] is False
+    assert report["progress_closed"] is True
+    assert report["editor_unlocked"] is True
+
+    assert report["messages"], "окно с ошибкой не показано"
+    kind, text = report["messages"][0]
+    assert text.startswith("Ошибка API:"), text
+    assert "boom" in text
+
+    assert "Traceback (most recent call last)" in stderr, stderr[-2000:]
+    assert "DeepSeekAPIError" in stderr, stderr[-2000:]
+
+
+def test_rusify_crash_reports_critical_error() -> None:
+    """Неожиданное падение движка: «Критическая ошибка» и трейсбек, не тишина."""
+    report, stderr = _run_gui_script_capture(_SCRIPT_RUSIFY_CRASH)
+
+    assert report["cancelled"] is False
+    assert report["progress_closed"] is True
+    assert report["editor_unlocked"] is True
+
+    assert report["messages"], "окно с ошибкой не показано"
+    _, text = report["messages"][0]
+    assert text == "Критическая ошибка: движок сломался", text
+
+    assert "Traceback (most recent call last)" in stderr, stderr[-2000:]
+    assert "RuntimeError: движок сломался" in stderr, stderr[-2000:]
 
 
 def test_gui_entrypoint_imports() -> None:
