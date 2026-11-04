@@ -49,12 +49,41 @@ report = {}
 _SCRIPT_UI = (
     _SCRIPT_PREAMBLE
     + """
-toolbars = window.findChildren(QToolBar)
 report["central_is_stack"] = isinstance(window.centralWidget(), QStackedWidget)
 report["stack_count"] = window.stack.count()
 report["start_index"] = window.stack.currentIndex()
 report["start_screen_is_page0"] = window.stack.widget(0) is window.start_screen
-report["editor_is_page1"] = window.stack.widget(1) is window.tabs
+report["editor_is_page1"] = window.stack.widget(1) is window.editor_screen
+report["ribbon_in_editor_screen"] = (
+    window.editor_screen.layout().itemAt(0).widget() is window.ribbon
+)
+report["tabs_in_editor_screen"] = (
+    window.editor_screen.layout().itemAt(1).widget() is window.tabs
+)
+report["toolbar_count"] = len(window.findChildren(QToolBar))
+report["ribbon_tabs"] = window.ribbon.tab_names()
+report["ribbon_current"] = window.ribbon.current_tab()
+report["ribbon_home"] = window.ribbon.actions_on("Главная")
+report["ribbon_insert"] = window.ribbon.actions_on("Вставка")
+report["ribbon_termru"] = window.ribbon.actions_on("TermRu")
+report["ribbon_view_groups"] = sorted(
+    title for (tab, title) in window.ribbon._groups if tab == "Вид"
+)
+report["ribbon_quick"] = [
+    window.ribbon.quick_layout.itemAt(i).widget().defaultAction().objectName()
+    for i in range(window.ribbon.quick_layout.count())
+]
+report["ribbon_icons_ok"] = all(
+    not action.icon().isNull()
+    for action in (
+        window.action_bold,
+        window.action_italic,
+        window.action_table,
+        window.action_russify,
+    )
+)
+report["ribbon_use_llm"] = window.ribbon.use_llm_check.text()
+report["ribbon_zoom"] = window.ribbon.zoom_slider.value()
 report["start_heading"] = window.start_screen.findChild(QLabel, "startTitle").text()
 report["start_subtitle"] = window.start_screen.findChild(QLabel, "startSubtitle").text()
 report["start_cards"] = sorted(window.start_screen._cards)
@@ -74,11 +103,6 @@ report["file_menu"] = [
     action.text()
     for action in window.menuBar().actions()[0].menu().actions()
     if not action.isSeparator()
-]
-report["toolbar_actions"] = len(toolbars[0].actions()) if toolbars else 0
-report["toolbar_count"] = len(toolbars)
-report["format_actions"] = [
-    action.objectName() for action in window.format_toolbar.actions() if action.objectName()
 ]
 report["tools_menu"] = [
     action.text()
@@ -181,6 +205,9 @@ _SCRIPT_FORMAT = (
     + """
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QTextCursor, QTextListFormat
+
+# Форматирование доступно только в редакторе: на стартовом экране действия выключены.
+window.show_editor()
 
 editor = window.editor
 editor.setPlainText("hello world")
@@ -444,7 +471,7 @@ report["status_path"] = window.status_path.text()
 report["status_counts"] = window.status_counts.text()
 report["title"] = window.windowTitle()
 report["russify_label"] = window.action_russify.text()
-report["format_hidden"] = window.format_toolbar.isHidden()
+report["format_disabled"] = not window.action_bold.isEnabled()
 
 # Таблица на слайде тоже даёт текстовые блоки -- по одному на ячейку.
 editor.select_slide(1)
@@ -711,7 +738,7 @@ report["status_path"] = window.status_path.text()
 report["status_counts"] = window.status_counts.text()
 report["title"] = window.windowTitle()
 report["russify_label"] = window.action_russify.text()
-report["format_hidden"] = window.format_toolbar.isHidden()
+report["format_disabled"] = not window.action_bold.isEnabled()
 
 # Вторая страница: свой набор блоков.
 editor.select_page(1)
@@ -1443,8 +1470,23 @@ def test_main_window_builds_ui() -> None:
     assert report["pptx_editor_in_tab1"] is True
     assert report["pdf_editor_in_tab2"] is True
     assert len(report["menus"]) == 4, report["menus"]
-    assert report["toolbar_actions"] >= 3
-    assert report["toolbar_count"] == 2
+    assert report["toolbar_count"] == 0, "старый QToolBar не убран из редактора"
+    assert report["ribbon_in_editor_screen"] is True, "лента не попала в экран редактора"
+    assert report["tabs_in_editor_screen"] is True
+    assert report["ribbon_tabs"] == ["Главная", "Вставка", "TermRu", "Вид"], report[
+        "ribbon_tabs"
+    ]
+    assert report["ribbon_current"] == "Главная"
+    assert report["ribbon_quick"] == [
+        "actionOpen",
+        "actionSave",
+        "actionSaveAs",
+        "actionHome",
+    ], report["ribbon_quick"]
+    assert report["ribbon_icons_ok"] is True, "у кнопок ленты нет иконок qtawesome"
+    assert report["ribbon_view_groups"] == ["Масштаб", "Тема"], report["ribbon_view_groups"]
+    assert report["ribbon_use_llm"] == "Использовать ИИ (DeepSeek)"
+    assert report["ribbon_zoom"] == 100
     assert report["tools_menu"] == [
         "Редактор словаря…",
         "Настройки…",
@@ -1455,11 +1497,11 @@ def test_main_window_builds_ui() -> None:
     assert report["title"].startswith("TermRu — Редактор документов")
 
 
-def test_format_toolbar_actions_exist() -> None:
-    """На панели форматирования есть B/I/U, выравнивание, списки и таблица."""
+def test_format_actions_in_ribbon() -> None:
+    """Действия форматирования лежат на вкладке «Главная» в своих группах."""
     report = _run_gui_script(_SCRIPT_UI)
 
-    assert report["format_actions"] == [
+    assert report["ribbon_home"] == [
         "action_bold",
         "action_italic",
         "action_underline",
@@ -1468,7 +1510,17 @@ def test_format_toolbar_actions_exist() -> None:
         "action_align_right",
         "action_bullet_list",
         "action_numbered_list",
+        "action_undo",
+        "action_redo",
+        "action_find",
+    ], report["ribbon_home"]
+    assert report["ribbon_insert"] == [
         "action_table",
+        "action_image",
+        "action_text_box",
+    ], report["ribbon_insert"]
+    assert report["ribbon_termru"] == ["action_russify", "actionGlossary"], report[
+        "ribbon_termru"
     ]
 
 
@@ -1605,7 +1657,7 @@ def test_pptx_editor_load(tmp_path: Path) -> None:
     assert report["status_counts"] == "Слайдов: 3 · Блоков: 2", report["status_counts"]
     assert report["title"] == f"TermRu — Редактор документов — deck.pptx[*]"
     assert report["russify_label"] == "Русифицировать слайд"
-    assert report["format_hidden"] is True, "панель форматирования DOCX осталась видна"
+    assert report["format_disabled"] is True, "форматирование DOCX осталось доступным"
 
     assert report["table_blocks"] == 2, "ячейки таблицы не попали в редактор"
     assert report["table_texts"] == ["TLS handshake", "milestone owner"]
@@ -1710,7 +1762,7 @@ def test_pdf_editor_load(tmp_path: Path) -> None:
     assert report["status_counts"] == "Страниц: 2 · Блоков: 3", report["status_counts"]
     assert report["title"] == "TermRu — Редактор документов — report.pdf[*]"
     assert report["russify_label"] == "Русифицировать страницу"
-    assert report["format_hidden"] is True, "панель форматирования DOCX осталась видна"
+    assert report["format_disabled"] is True, "форматирование DOCX осталось доступным"
 
     assert report["page2_ids"] == [3], report["page2_ids"]
     assert report["page2_texts"] == ["Second page with deadline"]
@@ -2109,6 +2161,165 @@ def test_start_screen_open_and_recent(tmp_path: Path) -> None:
     assert report["bad_open"] is False
     assert report["error_shown"] is True
     assert report["index_after_bad"] == 0, "после ошибки окно не вернулось на главную"
+
+
+#: Проверка вкладок ленты: состав, переключение и группы.
+_SCRIPT_RIBBON_TABS = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtCore import Qt
+
+ribbon = window.ribbon
+report["tab_count"] = ribbon.tabs.count()
+report["tab_names"] = ribbon.tab_names()
+report["stack_count"] = ribbon.stack.count()
+report["current"] = ribbon.current_tab()
+report["initial_index"] = ribbon.tabs.currentIndex()
+
+report["home_groups"] = sorted(
+    title for (tab, title) in ribbon._groups if tab == "Главная"
+)
+report["insert_groups"] = sorted(
+    title for (tab, title) in ribbon._groups if tab == "Вставка"
+)
+report["termru_groups"] = sorted(
+    title for (tab, title) in ribbon._groups if tab == "TermRu"
+)
+report["view_groups"] = sorted(
+    title for (tab, title) in ribbon._groups if tab == "Вид"
+)
+
+ribbon.set_current_tab("Вид")
+report["after_switch"] = ribbon.current_tab()
+report["stack_follows_tabs"] = ribbon.stack.currentIndex() == ribbon.tabs.currentIndex()
+
+# Лента адаптируется под ширину: узкое окно прячет ленту, оставляя вкладки.
+report["full_height"] = ribbon.height()
+ribbon.apply_width(600)
+report["collapsed_height"] = ribbon.height()
+report["collapsed_stack_hidden"] = ribbon.stack.isHidden()
+ribbon.apply_width(1200)
+report["expanded_stack_visible"] = not ribbon.stack.isHidden()
+report["expanded_height"] = ribbon.height()
+ribbon.apply_width(900)
+report["compact"] = ribbon._compact
+big_button = ribbon.button_for("action_russify")
+report["compact_icon_only"] = (
+    big_button.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonIconOnly
+)
+ribbon.apply_width(1200)
+report["expanded_text_under_icon"] = (
+    big_button.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonTextUnderIcon
+)
+
+print(json.dumps(report))
+"""
+)
+
+#: Проверка размещения кнопки русификации на вкладке TermRu.
+_SCRIPT_RIBBON_RUSIFY = (
+    _SCRIPT_PREAMBLE
+    + """
+ribbon = window.ribbon
+report["tab_of_action"] = ribbon.tab_of_action("action_russify")
+report["termru_actions"] = ribbon.actions_on("TermRu")
+
+button = ribbon.button_for("action_russify")
+report["button_exists"] = button is not None
+report["bound_action"] = (
+    button.defaultAction().objectName() if button is not None else None
+)
+report["button_text"] = button.text() if button is not None else ""
+report["button_big"] = (
+    button.property("big") if button is not None else None
+)
+report["button_page"] = (
+    button.parent().parent().parent().objectName() if button is not None else None
+)
+
+group_title = None
+group_tab = None
+if button is not None:
+    for (tab, title), group in ribbon._groups.items():
+        if button in group.buttons:
+            group_tab = tab
+            group_title = title
+report["group_of_button"] = group_title
+report["tab_of_group"] = group_tab
+
+report["termru_page_exports"] = getattr(window, "action_russify", None) is not None
+
+# Чекбокс ИИ лежит на той же вкладке TermRu.
+llm_page = ribbon.use_llm_check.parent().parent().parent()
+report["llm_page"] = llm_page.objectName()
+report["llm_text"] = ribbon.use_llm_check.text()
+
+print(json.dumps(report))
+"""
+)
+
+
+def test_ribbon_widget_has_tabs() -> None:
+    """Лента собрана из четырёх вкладок, у каждой есть свои группы."""
+    report = _run_gui_script(_SCRIPT_RIBBON_TABS)
+
+    assert report["tab_count"] == 4, report["tab_names"]
+    assert report["tab_names"] == ["Главная", "Вставка", "TermRu", "Вид"], report[
+        "tab_names"
+    ]
+    assert report["stack_count"] == 4, "у каждой вкладки должна быть своя лента"
+    assert report["initial_index"] == 0
+    assert report["current"] == "Главная"
+
+    assert report["home_groups"] == [
+        "Абзац",
+        "Редактирование",
+        "Шрифт",
+    ], report["home_groups"]
+    assert report["insert_groups"] == [
+        "Иллюстрации",
+        "Таблицы",
+        "Текст",
+    ], report["insert_groups"]
+    assert report["termru_groups"] == ["Искусственный интеллект", "Русификация", "Словарь"], (
+        report["termru_groups"]
+    )
+    assert report["view_groups"] == ["Масштаб", "Тема"], report["view_groups"]
+
+    assert report["after_switch"] == "Вид"
+    assert report["stack_follows_tabs"] is True, "лента не переключилась на вкладку"
+
+    assert report["full_height"] == 128, report["full_height"]
+    assert report["collapsed_height"] < report["full_height"], report["collapsed_height"]
+    assert report["collapsed_stack_hidden"] is True, "узкая лента не свернулась"
+    assert report["expanded_stack_visible"] is True, "лента не развернулась обратно"
+    assert report["expanded_height"] == report["full_height"], report["expanded_height"]
+
+    assert report["compact"] is True, "промежуточная ширина не включила иконочный режим"
+    assert report["compact_icon_only"] is True, "в узком режиме осталась подпись"
+    assert report["expanded_text_under_icon"] is True, (
+        "в широком режиме подпись под иконкой не вернулась"
+    )
+
+
+def test_rusify_action_in_ribbon() -> None:
+    """Кнопка русификации живёт на вкладке TermRu и связана со своим действием."""
+    report = _run_gui_script(_SCRIPT_RIBBON_RUSIFY)
+
+    assert report["tab_of_action"] == "TermRu", report["tab_of_action"]
+    assert "action_russify" in report["termru_actions"], report["termru_actions"]
+
+    assert report["button_exists"] is True, "кнопка русификации не создана"
+    assert report["bound_action"] == "action_russify"
+    assert report["button_text"] == "Русифицировать документ", report["button_text"]
+    assert report["button_big"] == "true", "кнопка русификации должна быть крупной"
+
+    assert report["group_of_button"] == "Русификация", report["group_of_button"]
+    assert report["tab_of_group"] == "TermRu", report["tab_of_group"]
+    assert report["button_page"] == "ribbonPageTermRu", report["button_page"]
+
+    assert report["llm_page"] == "ribbonPageTermRu", report["llm_page"]
+    assert report["llm_text"] == "Использовать ИИ (DeepSeek)", report["llm_text"]
 
 
 def test_gui_entrypoint_imports() -> None:

@@ -168,6 +168,8 @@ class PdfEditor(QWidget):
         self._editors: dict[int, QTextEdit] = {}
         self._current_page = -1
         self._page_pixmap: QPixmap | None = None
+        #: Множитель рендера страниц (масштаб из ленты, 1.0 — 100 %).
+        self._zoom = ZOOM
         self._paging_available = True
         self._loading = False
         self._build_ui()
@@ -645,6 +647,25 @@ class PdfEditor(QWidget):
         )
 
     # -- страницы ------------------------------------------------------------
+    def set_zoom(self, factor: float) -> None:
+        """Задать масштаб рендера страниц и перерисовать текущую.
+
+        Args:
+            factor: Множитель масштаба (1.0 — 100 %).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        value = max(0.5, min(3.0, float(factor)))
+        if abs(value - self._zoom) < 1e-6:
+            return
+        self._zoom = value
+        if self._document is not None and self._current_page >= 0:
+            self.render_page(self._current_page)
+
     def render_page(self, index: int) -> None:
         """Показать страницу ``index``: картинку и её текстовые блоки.
 
@@ -691,7 +712,7 @@ class PdfEditor(QWidget):
         self._page_pixmap = None
         try:
             page = self._document[index]
-            bitmap = page.render(scale=ZOOM)
+            bitmap = page.render(scale=self._zoom)
             try:
                 image = QImage(
                     bitmap.buffer,
