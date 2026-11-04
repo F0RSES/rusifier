@@ -16,7 +16,7 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 #: Версия релиза; при бампе меняется здесь и во всех манифестах.
-EXPECTED_VERSION = "0.2.0"
+EXPECTED_VERSION = "1.0.0"
 
 #: Собранный бинарник: onedir (`dist/termru/termru`) или onefile (`dist/termru`).
 _BINARY_CANDIDATES = (

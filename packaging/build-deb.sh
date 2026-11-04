@@ -61,7 +61,7 @@ echo "==> Артефакты"
 mkdir -p "$PROJECT_ROOT/dist"
 for deb in "$PROJECT_ROOT"/installer/*.deb; do
   [[ -f "$deb" ]] || continue
-  # unifypy называет файл по "name" (TermRu_0.2.0_amd64.deb), а пакет и
+  # unifypy называет файл по "name" (TermRu_<version>_amd64.deb), а пакет и
   # привычное имя файла — termru: приводим к нижнему регистру.
   target="$PROJECT_ROOT/dist/$(basename "$deb" | sed 's/^TermRu_/termru_/')"
   cp -f "$deb" "$target"
