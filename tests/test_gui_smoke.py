@@ -88,7 +88,8 @@ report["start_heading"] = window.start_screen.findChild(QLabel, "startTitle").te
 report["start_subtitle"] = window.start_screen.findChild(QLabel, "startSubtitle").text()
 report["start_cards"] = sorted(window.start_screen._cards)
 report["start_icons_ok"] = all(
-    not card.icon().isNull() for card in window.start_screen._cards.values()
+    label.pixmap() is not None and not label.pixmap().isNull()
+    for label in window.start_screen.card_icons.values()
 )
 report["nav_buttons"] = sorted(window.start_screen.nav_buttons)
 report["recent_files"] = window.start_screen.recent_files()
@@ -1447,7 +1448,7 @@ def test_main_window_builds_ui() -> None:
     assert report["editor_is_page1"] is True
 
     assert report["start_heading"] == "Добро пожаловать в TermRu"
-    assert report["start_subtitle"] == "Умный редактор документов с русификацией"
+    assert report["start_subtitle"] == "Умный редактор документов с ИИ-русификацией"
     assert report["start_cards"] == ["docx", "pdf", "pptx"], report["start_cards"]
     assert report["start_icons_ok"] is True, "иконки qtawesome не загрузились"
     assert report["nav_buttons"] == ["about", "home", "open", "settings"]
@@ -2101,6 +2102,139 @@ def test_rusify_crash_reports_critical_error() -> None:
 
     assert "Traceback (most recent call last)" in stderr, stderr[-2000:]
     assert "RuntimeError: движок сломался" in stderr, stderr[-2000:]
+
+
+#: Проверка стартового состояния: центральный стек открыт на приветствии.
+_SCRIPT_START_DEFAULT = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtWidgets import QLabel, QPushButton
+
+start = window.start_screen
+report["central_is_stack"] = isinstance(window.centralWidget(), QStackedWidget)
+report["stack_count"] = window.stack.count()
+report["index"] = window.stack.currentIndex()
+report["page0_is_start"] = window.stack.widget(0) is start
+report["current_is_start"] = window.stack.currentWidget() is start
+report["editor_is_page1"] = window.stack.widget(1) is window.editor_screen
+report["editor_not_current"] = window.stack.currentWidget() is not window.editor_screen
+
+report["title"] = start.findChild(QLabel, "startTitle").text()
+report["subtitle"] = start.findChild(QLabel, "startSubtitle").text()
+report["cards"] = [start._cards[kind].property("kind") for kind in ("docx", "pptx", "pdf")]
+report["card_titles"] = [
+    start._cards[kind].findChild(QLabel, "cardTitle").text()
+    for kind in ("docx", "pptx", "pdf")
+]
+report["card_captions"] = [
+    start._cards[kind].findChild(QLabel, "cardCaption").text()
+    for kind in ("docx", "pptx", "pdf")
+]
+report["card_icon_sizes"] = [
+    [start.card_icons[kind].pixmap().width(), start.card_icons[kind].pixmap().height()]
+    for kind in ("docx", "pptx", "pdf")
+]
+report["open_button"] = start.open_button.text()
+report["nav"] = [start.nav_buttons[key].text() for key in ("home", "open", "settings", "about")]
+report["nav_active"] = [
+    key for key in ("home", "open", "settings", "about")
+    if start.nav_buttons[key].property("active") == "true"
+]
+report["recent"] = start.recent_files()
+report["recent_placeholder"] = [
+    label.text() for label in start.recent_container.findChildren(QLabel)
+]
+report["editor_hidden"] = window.editor_screen.isHidden()
+
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Проверка перехода со стартового экрана в редактор через open_path().
+_SCRIPT_START_OPEN_EDITOR = (
+    _SCRIPT_PREAMBLE
+    + """
+sample = sys.argv[1]
+report["index_before"] = window.stack.currentIndex()
+report["page_before_is_start"] = window.stack.currentWidget() is window.start_screen
+
+report["opened"] = window.open_path(sample)
+report["index_after"] = window.stack.currentIndex()
+report["page_after_is_editor"] = window.stack.currentWidget() is window.editor_screen
+report["tab_after"] = window.tabs.currentIndex()
+report["text_loaded"] = "roadmap" in window.editor.toPlainText().lower()
+report["recent"] = window.start_screen.recent_files()
+
+window.show_start_screen()
+report["index_after_home"] = window.stack.currentIndex()
+report["page_after_home_is_start"] = (
+    window.stack.currentWidget() is window.start_screen
+)
+
+window.editor.mark_saved()
+window.pptx_editor.mark_saved()
+window.pdf_editor.close_document()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+def test_start_screen_is_default() -> None:
+    """При запуске центральный стек показывает стартовый экран, а не редактор."""
+    report = _run_gui_script(_SCRIPT_START_DEFAULT)
+
+    assert report["central_is_stack"] is True
+    assert report["stack_count"] == 2, report["stack_count"]
+    assert report["index"] == 0, "при запуске должен открываться стартовый экран"
+    assert report["page0_is_start"] is True
+    assert report["current_is_start"] is True, "стартовый экран не активен"
+    assert report["editor_is_page1"] is True
+    assert report["editor_not_current"] is True, "редактор показан вместо приветствия"
+    assert report["editor_hidden"] is True
+
+    assert report["title"] == "Добро пожаловать в TermRu"
+    assert report["subtitle"] == "Умный редактор документов с ИИ-русификацией"
+    assert report["cards"] == ["docx", "pptx", "pdf"], report["cards"]
+    assert report["card_titles"] == ["Word", "PowerPoint", "PDF"], report["card_titles"]
+    assert report["card_captions"] == [
+        "Документ DOCX",
+        "Презентация PPTX",
+        "Пустая страница PDF",
+    ], report["card_captions"]
+    assert report["card_icon_sizes"] == [[48, 48], [48, 48], [48, 48]], report[
+        "card_icon_sizes"
+    ]
+    assert report["open_button"] == "Открыть файл с компьютера…"
+    assert report["nav"] == ["Главная", "Открыть файл", "Настройки", "О программе"]
+    assert report["nav_active"] == ["home"], "активным должен быть только «Главная»"
+    assert report["recent"] == []
+    assert report["recent_placeholder"] == [
+        "Пока пусто — откройте первый документ."
+    ], report["recent_placeholder"]
+
+
+def test_start_screen_open_file() -> None:
+    """``open_path`` уводит со стартового экрана в редактор, «Главная» — обратно."""
+    sample = PROJECT_ROOT / "tests" / "fixtures" / "sample.docx"
+    assert sample.is_file()
+
+    report = _run_gui_script(_SCRIPT_START_OPEN_EDITOR, str(sample))
+
+    assert report["index_before"] == 0
+    assert report["page_before_is_start"] is True
+
+    assert report["opened"] is True
+    assert report["index_after"] == 1, "стек не переключился на редактор"
+    assert report["page_after_is_editor"] is True
+    assert report["tab_after"] == 0
+    assert report["text_loaded"] is True
+    assert report["recent"] == [str(sample)], report["recent"]
+
+    assert report["index_after_home"] == 0
+    assert report["page_after_home_is_start"] is True
+
 
 
 def test_start_screen_create_documents(tmp_path: Path) -> None:

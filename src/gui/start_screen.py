@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon
 from PySide6.QtWidgets import (
     QFrame,
@@ -31,7 +31,7 @@ from .settings import THEME_DARK, load_settings
 WELCOME_TITLE = "Добро пожаловать в TermRu"
 
 #: Подзаголовок приветственного экрана.
-WELCOME_SUBTITLE = "Умный редактор документов с русификацией"
+WELCOME_SUBTITLE = "Умный редактор документов с ИИ-русификацией"
 
 #: Карточки создания: ``(вид, заголовок, подпись, иконка, цвет иконки)``.
 CREATE_CARDS = (
@@ -84,6 +84,9 @@ QScrollArea#startScroll {{
 QWidget#startContent {{
     background: {bg};
 }}
+QWidget#recentContainer {{
+    background: transparent;
+}}
 QWidget#startRoot QLabel {{
     background: transparent;
 }}
@@ -131,13 +134,20 @@ QPushButton[nav="true"] {{
 QPushButton[nav="true"]:hover {{
     background: {card_hover};
 }}
+QPushButton[nav="true"][active="true"] {{
+    background: {card};
+    color: {text};
+    font-weight: 600;
+    border-left: 3px solid {accent};
+    border-radius: 0 6px 6px 0;
+}}
 QPushButton[card="true"] {{
     background: {card};
     border: 1px solid {border};
     border-radius: 12px;
     color: {text};
     font-size: 12pt;
-    padding: 18px 14px;
+    padding: 14px 14px;
     text-align: center;
 }}
 QPushButton[card="true"]:hover {{
@@ -146,6 +156,19 @@ QPushButton[card="true"]:hover {{
 }}
 QPushButton[card="true"]:pressed {{
     background: {border};
+}}
+QPushButton[card="true"] QLabel {{
+    background: transparent;
+    border: none;
+}}
+QLabel#cardTitle {{
+    color: {text};
+    font-size: 12pt;
+    font-weight: 600;
+}}
+QLabel#cardCaption {{
+    color: {muted};
+    font-size: 9pt;
 }}
 QPushButton#openButton {{
     background: {card};
@@ -162,7 +185,8 @@ QPushButton#openButton:hover {{
 }}
 QPushButton[recent="true"] {{
     text-align: left;
-    background: transparent;
+    background: none;
+    background-color: transparent;
     border: none;
     color: {accent};
     padding: 3px 2px;
@@ -285,9 +309,7 @@ class StartScreen(QWidget):
         content_layout.addSpacing(14)
 
         content_layout.addWidget(self._section("Открыть", content))
-        self.open_button = QPushButton(
-            "Открыть файл с компьютера", content
-        )
+        self.open_button = QPushButton("Открыть файл с компьютера…", content)
         self.open_button.setObjectName("openButton")
         self.open_button.setIcon(qt_icon("fa5s.folder-open", "#4a90d9"))
         self.open_button.setIconSize(self.open_button.iconSize() * 1.2)
@@ -298,6 +320,7 @@ class StartScreen(QWidget):
 
         content_layout.addWidget(self._section("Недавние файлы", content))
         self.recent_container = QWidget(content)
+        self.recent_container.setObjectName("recentContainer")
         self._recent_layout = QVBoxLayout(self.recent_container)
         self._recent_layout.setContentsMargins(0, 0, 0, 0)
         self._recent_layout.setSpacing(2)
@@ -339,6 +362,8 @@ class StartScreen(QWidget):
         for key, text, icon_name in NAV_ITEMS:
             button = QPushButton(text, sidebar)
             button.setProperty("nav", "true")
+            # «Главная» — текущий экран, поэтому пункт подсвечен как активный.
+            button.setProperty("active", "true" if key == "home" else "false")
             button.setIcon(qt_icon(icon_name, "#9aa0a6"))
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             button.clicked.connect(handlers[key])
@@ -374,6 +399,10 @@ class StartScreen(QWidget):
     def _build_cards(self, parent: QWidget) -> QHBoxLayout:
         """Создать три карточки «новый документ».
 
+        Карточка — это ``QPushButton`` с вертикальной раскладкой внутри: иконка
+        48×48, название формата и подпись. Раскладка нужна, чтобы иконка стояла
+        над текстом (у самой кнопки иконка рисуется только сбоку).
+
         Args:
             parent: Родительский виджет.
 
@@ -385,20 +414,49 @@ class StartScreen(QWidget):
         """
         row = QHBoxLayout()
         row.setSpacing(14)
+        self.card_icons: dict[str, QLabel] = {}
         for kind, title, caption, icon_name, color in CREATE_CARDS:
-            card = QPushButton(f"{title}\n{caption}", parent)
+            card = QPushButton(parent)
             card.setObjectName(f"card{kind.capitalize()}")
             card.setProperty("card", "true")
             card.setProperty("kind", kind)
-            card.setIcon(qt_icon(icon_name, color))
-            card.setIconSize(card.iconSize() * 2.2)
-            card.setMinimumHeight(112)
+            card.setMinimumHeight(134)
             card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             card.setCursor(Qt.CursorShape.PointingHandCursor)
             card.setToolTip(f"Создать пустой {caption.lower()}")
-            card.clicked.connect(lambda _checked=False, k=kind: self.create_requested.emit(k))
+
+            inner = QVBoxLayout(card)
+            inner.setContentsMargins(12, 16, 12, 16)
+            inner.setSpacing(6)
+
+            icon_label = QLabel(card)
+            icon_label.setObjectName("cardIcon")
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            icon_label.setPixmap(qt_icon(icon_name, color).pixmap(QSize(48, 48)))
+            icon_label.setFixedHeight(48)
+            inner.addWidget(icon_label)
+
+            title_label = QLabel(title, card)
+            title_label.setObjectName("cardTitle")
+            title_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            inner.addWidget(title_label)
+
+            caption_label = QLabel(caption, card)
+            caption_label.setObjectName("cardCaption")
+            caption_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            caption_label.setWordWrap(True)
+            inner.addWidget(caption_label)
+
+            # Клик должен доходить до кнопки, даже если попал в подпись.
+            for label in (icon_label, title_label, caption_label):
+                label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
+            card.clicked.connect(
+                lambda _checked=False, k=kind: self.create_requested.emit(k)
+            )
             row.addWidget(card)
             self._cards[kind] = card
+            self.card_icons[kind] = icon_label
         return row
 
     # -- недавние файлы ------------------------------------------------------
