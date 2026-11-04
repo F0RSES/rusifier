@@ -58,7 +58,8 @@ class RusifyWorker(QThread):
 
     Signals:
         progress: процент выполнения (0–100).
-        result_ready: ``(новый текст, список замен)``.
+        result_ready: ``(новый текст, список замен)``. Пустой список — валидный
+            результат: совпадений не нашлось, ошибки нет.
         failed: текст ошибки, если движок упал.
 
     Args:
@@ -122,6 +123,14 @@ class RusifyWorker(QThread):
             Ничего не бросает: исключение превращается в сигнал ``failed``.
         """
         try:
+            if not self._text.strip():
+                # Пустой документ — не ошибка: отдаём исходный текст и пустой
+                # список замен, чтобы окно показало «Замен не найдено».
+                LOGGER.info("Пустой текст: замен не будет")
+                self.progress.emit(100)
+                self.result_ready.emit(self._text, [])
+                return
+
             LOGGER.info("Начало словарной замены")
             self.progress.emit(10)
             text_after_dict, changes = self._engine.replace_dict_only(self._text)
@@ -136,6 +145,10 @@ class RusifyWorker(QThread):
                 changes = list(changes) + llm_changes
 
             self.progress.emit(100)
+            if not changes:
+                # Совпадений нет, но это валидный результат: окно покажет
+                # подсказку, а не ошибку.
+                LOGGER.info("Замен не найдено — отправляем пустой результат")
             self.result_ready.emit(text_after_dict, list(changes))
         except DeepSeekError as exc:
             # Ожидаемая ошибка API: трейсбек нужен для диагностики, но

@@ -53,7 +53,9 @@ from .rusify import (
     RusifyWorker,
 )
 from .settings import (
+    KEY_USE_LLM,
     SettingsDialog,
+    app_settings,
     apply_theme,
     load_recent_files,
     load_settings,
@@ -70,6 +72,16 @@ ANY_FILTER = "Документы TermRu (*.docx *.pptx *.pdf)"
 NEW_DOCUMENT = "Новый документ"
 NEW_PRESENTATION = "Новая презентация"
 NEW_PDF = "PDF не открыт"
+
+#: Подсказка, когда ни словарь, ни ИИ не нашли совпадений.
+NO_REPLACEMENTS_MESSAGE = (
+    "Замен не найдено. Проверьте, есть ли эти слова в словаре "
+    "или включен ли ИИ (DeepSeek) в настройках."
+)
+
+#: Предупреждение, когда режим ИИ включён, а ключ не введён.
+MISSING_API_KEY_MESSAGE = "Введите API-ключ DeepSeek в настройках"
+
 WORD_TAB_TITLE = "Word (DOCX)"
 WORD_TAB_INDEX = 0
 PPTX_TAB_INDEX = 1
@@ -1498,6 +1510,13 @@ class MainWindow(QMainWindow):
             return
 
         settings = load_settings()
+        # load_settings() гасит флаг ИИ, если ключа нет, поэтому «пользователь
+        # включил ИИ, но не ввёл ключ» видно только по сырому значению.
+        wants_llm = bool(app_settings().value(KEY_USE_LLM, False, type=bool))
+        if wants_llm and not settings["api_key"]:
+            QMessageBox.warning(self, "Русификация", MISSING_API_KEY_MESSAGE)
+            return
+
         self._rusify_cancelled = False
         self._rusify_target = kind
         # Диалог живёт в атрибуте окна: иначе Python соберёт его сборщиком
@@ -1527,9 +1546,9 @@ class MainWindow(QMainWindow):
             glossary=self.glossary,
         )
         self._worker.progress.connect(self.progress_dialog.setValue)
-        self._worker.result_ready.connect(self._on_rusify_ready)
+        self._worker.result_ready.connect(self._on_rusify_finished)
         self._worker.failed.connect(self._on_rusify_failed)
-        self._worker.finished.connect(self._on_rusify_finished)
+        self._worker.finished.connect(self._on_rusify_thread_finished)
         self._worker.start()
 
     def _cancel_rusify(self) -> None:
@@ -1545,13 +1564,16 @@ class MainWindow(QMainWindow):
         self._set_surface_read_only(False)
         self.statusBar().showMessage("Русификация отменена", 3000)
 
-    def _on_rusify_ready(self, new_text: str, changes: object) -> None:
-        """Показать диалог предпросмотра и применить выбранные замены.
+    def _on_rusify_finished(self, new_text: str, changes: object) -> None:
+        """Закрыть прогресс и показать замены (или сообщить, что их нет).
+
+        Пустой список замен — не ошибка: пользователь получает подсказку,
+        где искать причину (словарь и режим ИИ).
 
         Args:
             new_text: Текст после замен (в диалоге не используется — замены
                 применяются к редактору по парам, чтобы сохранить форматирование).
-            changes: Список записей движка.
+            changes: Список записей движка; пустой список допустим.
 
         Returns:
             None
@@ -1566,14 +1588,8 @@ class MainWindow(QMainWindow):
 
         items = [item for item in (changes or []) if isinstance(item, dict)]
         if not items:
-            target = {
-                "word": "документе",
-                "pptx": "слайде",
-                "pdf": "странице",
-            }.get(getattr(self, "_rusify_target", "word"), "документе")
-            QMessageBox.information(
-                self, "Русификация", f"Словарных замен в {target} не найдено."
-            )
+            QMessageBox.information(self, "Русификация", NO_REPLACEMENTS_MESSAGE)
+            self.statusBar().showMessage("Замен не найдено", 5000)
             return
 
         dialog = ReplacementsDialog(items, self)
@@ -1606,7 +1622,7 @@ class MainWindow(QMainWindow):
         self._set_surface_read_only(False)
         QMessageBox.critical(self, "Ошибка русификации", message)
 
-    def _on_rusify_finished(self) -> None:
+    def _on_rusify_thread_finished(self) -> None:
         """Разблокировать редактор после завершения потока.
 
         Returns:

@@ -602,9 +602,9 @@ report["opened"] = window.open_path(src)
 report["texts_before"] = editor.block_texts()
 report["current_text_before"] = editor.current_text()
 
-# Ветка применения: _on_rusify_ready направляет замены в PPTX-редактор.
+# Ветка применения: _on_rusify_finished направляет замены в PPTX-редактор.
 window._rusify_target = "pptx"
-window._on_rusify_ready(
+window._on_rusify_finished(
     "",
     [
         {"original": "feedback", "replacement": "обратная связь", "source": "dict"},
@@ -863,9 +863,9 @@ report["opened"] = window.open_path(src)
 report["texts_before"] = editor.block_texts()
 report["current_text"] = editor.current_text()
 
-# Ветка применения: _on_rusify_ready направляет замены в PDF-редактор.
+# Ветка применения: _on_rusify_finished направляет замены в PDF-редактор.
 window._rusify_target = "pdf"
-window._on_rusify_ready(
+window._on_rusify_finished(
     "",
     [
         {"original": "feedback", "replacement": "обратная связь", "source": "dict"},
@@ -2049,6 +2049,140 @@ def test_unifypy_config_builds_gui() -> None:
     assert "fitz" in excludes
     assert "pypdfium2" not in excludes
     assert "pypdfium2_raw" not in excludes
+
+
+#: Прогон без совпадений: показываем подсказку, диалог замен не открываем.
+_SCRIPT_RUSIFY_EMPTY = (
+    _SCRIPT_PREAMBLE
+    + """
+import src.gui.main_window as main_window
+
+messages = []
+main_window.QMessageBox.information = lambda *a, **k: messages.append(list(a[1:3]))
+main_window.QMessageBox.critical = lambda *a, **k: messages.append(list(a[1:3]))
+main_window.QMessageBox.warning = lambda *a, **k: messages.append(list(a[1:3]))
+
+dialogs = []
+main_window.ReplacementsDialog.exec = (
+    lambda self: dialogs.append(1) or main_window.ReplacementsDialog.DialogCode.Rejected
+)
+
+window.show_editor()
+window.editor.setPlainText("Сегодня мы обсудили сроки и согласовали бюджет.")
+window.editor.document().setModified(False)
+window.russify_document()
+report["progress_created"] = window.progress_dialog is not None
+
+for _ in range(400):
+    app.processEvents()
+    if getattr(window, "_worker", None) is not None:
+        window._worker.wait(20000)
+for _ in range(400):
+    app.processEvents()
+
+report["messages"] = messages
+report["dialogs"] = dialogs
+report["text_after"] = window.editor.toPlainText()
+report["modified_after"] = window.editor.is_modified()
+report["progress_closed"] = getattr(window, "progress_dialog", None) is None
+report["editor_unlocked"] = not window.editor.isReadOnly()
+report["status"] = window.statusBar().currentMessage()
+
+# Воркер на пустом тексте отдаёт валидный результат, а не ошибку.
+from PySide6.QtCore import QEventLoop, QTimer
+
+from src.gui.rusify import RusifyWorker
+
+events = {"result": None, "error": None}
+loop = QEventLoop()
+worker = RusifyWorker("   ")
+worker.result_ready.connect(
+    lambda text, changes: (events.update(result=[text, list(changes)]), loop.quit())
+)
+worker.failed.connect(lambda message: (events.update(error=message), loop.quit()))
+worker.start()
+QTimer.singleShot(10000, loop.quit)
+loop.exec()
+worker.wait(3000)
+
+report["empty_result"] = events["result"]
+report["empty_error"] = events["error"]
+
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Режим ИИ включён, ключа нет: предупреждаем и не запускаем воркер.
+_SCRIPT_RUSIFY_NO_KEY = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtCore import QSettings
+
+import src.gui.main_window as main_window
+from src.gui.settings import APPLICATION, KEY_API, KEY_USE_LLM, ORGANIZATION
+
+warnings = []
+main_window.QMessageBox.warning = lambda *a, **k: warnings.append(list(a[1:3]))
+main_window.QMessageBox.information = lambda *a, **k: warnings.append(list(a[1:3]))
+
+settings = QSettings(ORGANIZATION, APPLICATION)
+settings.setValue(KEY_API, "")
+settings.setValue(KEY_USE_LLM, True)
+settings.sync()
+
+window.show_editor()
+window.editor.setPlainText("The feedback is here")
+window.russify_document()
+
+report["warnings"] = warnings
+report["worker_started"] = getattr(window, "_worker", None) is not None
+report["progress_created"] = getattr(window, "progress_dialog", None) is not None
+report["editor_locked"] = window.editor.isReadOnly()
+
+window.editor.mark_saved()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
+def test_rusify_empty_result_shows_message() -> None:
+    """Текст без англицизмов: информационное окно, а не молчание и не ошибка."""
+    report = _run_gui_script(_SCRIPT_RUSIFY_EMPTY)
+
+    assert report["progress_created"] is True, "прогресс-диалог не создан"
+    assert report["messages"] == [
+        [
+            "Русификация",
+            "Замен не найдено. Проверьте, есть ли эти слова в словаре "
+            "или включен ли ИИ (DeepSeek) в настройках.",
+        ]
+    ], report["messages"]
+    assert report["dialogs"] == [], "диалог замен открылся без замен"
+    assert report["text_after"] == "Сегодня мы обсудили сроки и согласовали бюджет."
+    assert report["modified_after"] is False, "текст без замен помечен изменённым"
+    assert report["progress_closed"] is True, "прогресс-диалог не закрыт"
+    assert report["editor_unlocked"] is True
+    assert "Замен не найдено" in report["status"], report["status"]
+
+    # Воркер на пустом тексте тоже отдаёт результат, а не ошибку.
+    assert report["empty_error"] is None, report["empty_error"]
+    assert report["empty_result"] == ["   ", []], report["empty_result"]
+
+
+def test_rusify_warns_without_api_key() -> None:
+    """ИИ включён, но ключа нет — предупреждение и воркер не стартует."""
+    report = _run_gui_script(_SCRIPT_RUSIFY_NO_KEY)
+
+    assert report["warnings"] == [
+        ["Русификация", "Введите API-ключ DeepSeek в настройках"]
+    ], report["warnings"]
+    assert report["worker_started"] is False, "воркер запустился без ключа"
+    assert report["progress_created"] is False, "прогресс-диалог показан без ключа"
+    assert report["editor_locked"] is False, "редактор заблокирован без запуска"
+
 
 
 def test_rusify_preview_is_shown() -> None:
