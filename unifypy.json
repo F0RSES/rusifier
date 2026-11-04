@@ -27,6 +27,7 @@
       "mammoth",
       "html2docx",
       "qdarkstyle",
+      "qtawesome",
       "PySide6.QtSvg",
       "PySide6.QtPrintSupport"
     ],

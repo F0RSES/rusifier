@@ -1,7 +1,8 @@
-"""Главное окно TermRu: меню, вкладки, панели инструментов, статус-бар.
+"""Главное окно TermRu: стартовый экран, редактор во вкладках, меню и статус-бар.
 
-Центральный виджет — ``QTabWidget``: вкладка Word (DOCX) и вкладка
-PowerPoint (PPTX). Меню и панели подстраиваются под активную вкладку.
+Центральный виджет — ``QStackedWidget``: 0 — приветственный экран
+(:class:`~src.gui.start_screen.StartScreen`), 1 — редактор с вкладками Word,
+PowerPoint и PDF. Меню и панели подстраиваются под активную вкладку.
 """
 
 
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressDialog,
+    QStackedWidget,
     QStyle,
     QTabWidget,
     QTextEdit,
@@ -48,7 +50,14 @@ from .rusify import (
     ReplacementsDialog,
     RusifyWorker,
 )
-from .settings import SettingsDialog, apply_theme, load_settings
+from .settings import (
+    SettingsDialog,
+    apply_theme,
+    load_recent_files,
+    load_settings,
+    remember_recent_file,
+)
+from .start_screen import StartScreen
 
 APP_TITLE = "TermRu — Редактор документов"
 DOCX_FILTER = "Документы Word (*.docx)"
@@ -62,6 +71,10 @@ WORD_TAB_TITLE = "Word (DOCX)"
 WORD_TAB_INDEX = 0
 PPTX_TAB_INDEX = 1
 PDF_TAB_INDEX = 2
+
+#: Страницы QStackedWidget: приветственный экран и редактор.
+START_INDEX = 0
+EDITOR_INDEX = 1
 
 #: Подписи действия «Русифицировать» для каждой вкладки.
 RUSSIFY_WORD_LABEL = "Русифицировать документ"
@@ -119,7 +132,23 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.editor, WORD_TAB_TITLE)
         self.tabs.addTab(self.pptx_editor, PPTX_TAB_TITLE)
         self.tabs.addTab(self.pdf_editor, PDF_TAB_TITLE)
-        self.setCentralWidget(self.tabs)
+
+        self.start_screen = StartScreen(self)
+        self.start_screen.create_requested.connect(self.new_document)
+        self.start_screen.open_requested.connect(self.open_document)
+        self.start_screen.recent_requested.connect(self.open_path)
+        self.start_screen.settings_requested.connect(self.open_settings)
+        self.start_screen.about_requested.connect(self.show_about)
+        self.start_screen.file_dropped.connect(self.open_path)
+        self.start_screen.set_recent_files(load_recent_files())
+
+        # Стек экранов: 0 — приветственный, 1 — редактор с вкладками.
+        self.stack = QStackedWidget(self)
+        self.stack.setObjectName("mainStack")
+        self.stack.addWidget(self.start_screen)  # START_INDEX
+        self.stack.addWidget(self.tabs)  # EDITOR_INDEX
+        self.stack.setCurrentIndex(START_INDEX)
+        self.setCentralWidget(self.stack)
 
         self._build_actions()
         self._build_menus()
@@ -239,6 +268,15 @@ class MainWindow(QMainWindow):
         self.action_quit.setShortcut(QKeySequence.StandardKey.Quit)
         self.action_quit.triggered.connect(self.close)
 
+        self.action_home = QAction(
+            style.standardIcon(QStyle.StandardPixmap.SP_DirHomeIcon),
+            "На главный экран",
+            self,
+        )
+        self.action_home.setObjectName("actionHome")
+        self.action_home.setShortcut(QKeySequence("Ctrl+Shift+H"))
+        self.action_home.triggered.connect(self.show_start_screen)
+
         self.action_russify = QAction(
             style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload),
             "Русифицировать документ",
@@ -279,6 +317,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.action_open)
         file_menu.addAction(self.action_save)
         file_menu.addAction(self.action_save_as)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_home)
         file_menu.addSeparator()
         file_menu.addAction(self.action_quit)
 
@@ -642,7 +682,8 @@ class MainWindow(QMainWindow):
             Ничего не бросает.
         """
         kind = self._active_kind()
-        self.format_toolbar.setVisible(kind == "word")
+        on_editor = self.stack.currentIndex() == EDITOR_INDEX
+        self.format_toolbar.setVisible(on_editor and kind == "word")
         self.action_russify.setText(RUSSIFY_LABELS[kind])
 
     def _on_tab_changed(self, _index: int) -> None:
@@ -660,6 +701,77 @@ class MainWindow(QMainWindow):
         self._sync_tab_ui()
         self._refresh_title()
         self._refresh_status()
+
+    # -- экраны --------------------------------------------------------------
+    def show_start_screen(self) -> None:
+        """Показать приветственный экран с недавними файлами.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.start_screen.set_recent_files(load_recent_files())
+        self.start_screen.refresh_style()
+        self.stack.setCurrentIndex(START_INDEX)
+        self._sync_tab_ui()
+        self._refresh_title()
+        self._refresh_status()
+
+    def show_editor(self) -> None:
+        """Переключить стек экранов на редактор документов.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.stack.setCurrentIndex(EDITOR_INDEX)
+        self._sync_tab_ui()
+        self._refresh_title()
+        self._refresh_status()
+
+    def new_document(self, kind: str = "docx") -> None:
+        """Создать пустой документ и открыть его в редакторе.
+
+        Args:
+            kind: ``"docx"``, ``"pptx"`` или ``"pdf"`` (неизвестное — DOCX).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        if kind == "pptx":
+            self.tabs.setCurrentIndex(PPTX_TAB_INDEX)
+            self.pptx_editor.new_document()
+        elif kind == "pdf":
+            self.tabs.setCurrentIndex(PDF_TAB_INDEX)
+            self.pdf_editor.new_document()
+        else:
+            self.tabs.setCurrentIndex(WORD_TAB_INDEX)
+            self.editor.clear()
+            self.editor.current_path = None
+            self.editor.mark_saved()
+        self.show_editor()
+        self.statusBar().showMessage("Создан новый документ", 3000)
+
+    def _remember_recent(self, filepath: str) -> None:
+        """Запомнить открытый файл и обновить список на стартовом экране.
+
+        Args:
+            filepath: Путь открытого файла.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.start_screen.set_recent_files(remember_recent_file(filepath))
 
     def _edit_target(self) -> QWidget | None:
         """Виджет, к которому применяются команды меню «Правка».
@@ -808,12 +920,17 @@ class MainWindow(QMainWindow):
             index, target = PPTX_TAB_INDEX, self.pptx_editor
         else:
             index, target = WORD_TAB_INDEX, self.editor
+        # Сначала показываем редактор, потом грузим файл: так пользователь видит,
+        # куда именно откроется документ.
+        self.show_editor()
         self.tabs.setCurrentIndex(index)
         if not target.load_file(filepath):
             self.statusBar().showMessage("Не удалось открыть файл", 5000)
+            self.show_start_screen()
             return False
         self._refresh_title()
         self._refresh_status()
+        self._remember_recent(filepath)
         self.statusBar().showMessage(f"Открыто: {Path(filepath).name}", 3000)
         return True
 
@@ -950,6 +1067,7 @@ class MainWindow(QMainWindow):
         state = load_settings()
         apply_theme(state["theme"])
         self.pdf_editor.set_font_substitution_mode(state["pdf_fonts"])
+        self.start_screen.refresh_style(state["theme"])
         mode = "ИИ + словарь" if state["use_llm"] else "только словарь"
         self.statusBar().showMessage(
             f"Настройки сохранены ({mode}, тема {state['theme']}, "

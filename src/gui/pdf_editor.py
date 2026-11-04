@@ -62,6 +62,43 @@ FONT_SUBSTITUTION_MODE = "always"
 _MAX_ERRORS_IN_DIALOG = 5
 
 
+def blank_pdf_bytes() -> bytes:
+    """Собрать пустой одностраничный PDF (A4, без текста).
+
+    Минимальный документ пишется вручную: тянуть reportlab ради пустой страницы
+    в GUI-бандл незачем.
+
+    Returns:
+        bytes: валидный PDF 1.4 с одной пустой страницей A4.
+
+    Raises:
+        Ничего не бросает.
+    """
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+        b"/Resources << >> /Contents 4 0 R >>",
+        b"<< /Length 0 >>\nstream\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+
+    xref_at = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_at}\n%%EOF\n"
+    ).encode()
+    return bytes(out)
+
+
 
 class PdfEditor(QWidget):
     """Текстовый редактор PDF с предпросмотром страницы.
@@ -125,6 +162,8 @@ class PdfEditor(QWidget):
         self._texts: dict[int, str] = {}
         #: Исходные тексты блоков (для флага изменений).
         self._original: dict[int, str] = {}
+        #: Байты только что созданного PDF: файла ещё нет (``current_path`` пуст).
+        self._pending_bytes: bytes | None = None
         #: Поля ввода текущей страницы: ``block_id -> QTextEdit``.
         self._editors: dict[int, QTextEdit] = {}
         self._current_page = -1
@@ -267,6 +306,7 @@ class PdfEditor(QWidget):
         self.close_document()
         self._document = document
         self.current_path = path
+        self._pending_bytes = None
         self._load_blocks(blocks, len(document))
 
         self.page_list.blockSignals(True)
@@ -353,6 +393,46 @@ class PdfEditor(QWidget):
         return pages if len(pages) >= count else []
 
     # -- запись --------------------------------------------------------------
+    def new_document(self) -> None:
+        """Создать пустой одностраничный PDF (файла ещё нет).
+
+        Байты держатся в памяти до первого сохранения: тогда ``save_file``
+        просто запишет их по выбранному пути и откроет файл заново.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает: ошибки показываются диалогом.
+        """
+        data = blank_pdf_bytes()
+        try:
+            document = pdfium.PdfDocument(data)
+        except Exception as exc:  # noqa: BLE001 - сбой генератора не должен падать
+            self._show_error("Не удалось создать PDF", exc)
+            return
+
+        self.close_document()
+        self._document = document
+        self.current_path = None
+        self._pending_bytes = data
+        self._blocks = []
+        self._original = {}
+        self._texts = {}
+        self._paging_available = True
+        self._current_page = -1
+
+        self.page_list.blockSignals(True)
+        self.page_list.clear()
+        for index in range(len(document)):
+            self.page_list.addItem(QListWidgetItem(f"{PAGE_PREFIX} {index + 1}"))
+        self.page_list.blockSignals(False)
+
+        self.page_list.setCurrentRow(0)
+        if self._current_page < 0:
+            self.render_page(0)
+        self.modified_changed.emit(False)
+
     def save_file(self, filepath: str) -> bool:
         """Записать правки в PDF (или перезаписать исходный файл).
 
@@ -370,10 +450,18 @@ class PdfEditor(QWidget):
             Ничего не бросает: ошибки и предупреждения показываются диалогом.
         """
         if self.current_path is None:
-            self._show_error(
-                "Не удалось сохранить PDF", RuntimeError("Документ не открыт")
-            )
-            return False
+            if self._pending_bytes is None:
+                self._show_error(
+                    "Не удалось сохранить PDF", RuntimeError("Документ не открыт")
+                )
+                return False
+            target = Path(filepath)
+            try:
+                target.write_bytes(self._pending_bytes)
+            except OSError as exc:
+                self._show_error("Не удалось сохранить PDF", exc)
+                return False
+            return self.load_file(str(target))
 
         self._flush_page()
         target = Path(filepath)
@@ -953,6 +1041,7 @@ class PdfEditor(QWidget):
         self._blocks = []
         self._texts = {}
         self._original = {}
+        self._pending_bytes = None
         self._paging_available = True
         self._current_page = -1
         self._page_pixmap = None

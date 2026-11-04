@@ -448,6 +448,34 @@ class PptxEditor(QWidget):
         self.file_loaded.emit(str(path))
         return True
 
+    def new_document(self) -> None:
+        """Создать пустую презентацию с одним пустым слайдом.
+
+        Файл ещё не существует (``current_path is None``), поэтому первое
+        сохранение пойдёт через «Сохранить как».
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self._flush_current_slide()
+        presentation = Presentation()
+        presentation.slides.add_slide(presentation.slide_layouts[6])  # Blank
+
+        self.slide_list.blockSignals(True)
+        self.slide_list.clear()
+        self.slide_list.blockSignals(False)
+        self._clear_panel()
+
+        self.presentation = presentation
+        self.current_path = None
+        self._current_index = -1
+        self._fill_slide_list()
+        self.slide_list.setCurrentRow(0)
+        self._set_modified(False)
+
     def save_file(self, filepath: str) -> bool:
         """Записать правки в PPTX.
 

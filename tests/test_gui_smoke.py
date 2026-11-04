@@ -25,10 +25,17 @@ _SCRIPT_PREAMBLE = """
 import json
 import os
 import sys
+import tempfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QTabWidget, QToolBar
+from PySide6.QtCore import QSettings
+from PySide6.QtWidgets import QApplication, QLabel, QStackedWidget, QToolBar
+
+# Изоляция QSettings: тесты не должны менять профиль пользователя.
+QSettings.setPath(
+    QSettings.Format.NativeFormat, QSettings.Scope.UserScope, tempfile.mkdtemp()
+)
 
 from src.gui.docx_editor import DocxEditor
 from src.gui.main_window import MainWindow
@@ -43,7 +50,19 @@ _SCRIPT_UI = (
     _SCRIPT_PREAMBLE
     + """
 toolbars = window.findChildren(QToolBar)
-report["central_is_tabs"] = isinstance(window.centralWidget(), QTabWidget)
+report["central_is_stack"] = isinstance(window.centralWidget(), QStackedWidget)
+report["stack_count"] = window.stack.count()
+report["start_index"] = window.stack.currentIndex()
+report["start_screen_is_page0"] = window.stack.widget(0) is window.start_screen
+report["editor_is_page1"] = window.stack.widget(1) is window.tabs
+report["start_heading"] = window.start_screen.findChild(QLabel, "startTitle").text()
+report["start_subtitle"] = window.start_screen.findChild(QLabel, "startSubtitle").text()
+report["start_cards"] = sorted(window.start_screen._cards)
+report["start_icons_ok"] = all(
+    not card.icon().isNull() for card in window.start_screen._cards.values()
+)
+report["nav_buttons"] = sorted(window.start_screen.nav_buttons)
+report["recent_files"] = window.start_screen.recent_files()
 report["tab_titles"] = [
     window.tabs.tabText(index) for index in range(window.tabs.count())
 ]
@@ -51,6 +70,11 @@ report["word_editor_in_tab0"] = window.tabs.widget(0) is window.editor
 report["pptx_editor_in_tab1"] = window.tabs.widget(1) is window.pptx_editor
 report["pdf_editor_in_tab2"] = window.tabs.widget(2) is window.pdf_editor
 report["menus"] = [action.text() for action in window.menuBar().actions()]
+report["file_menu"] = [
+    action.text()
+    for action in window.menuBar().actions()[0].menu().actions()
+    if not action.isSeparator()
+]
 report["toolbar_actions"] = len(toolbars[0].actions()) if toolbars else 0
 report["toolbar_count"] = len(toolbars)
 report["format_actions"] = [
@@ -1218,6 +1242,106 @@ print(json.dumps(report, ensure_ascii=False))
 )
 
 
+#: Стартовый экран: карточки создают документы и открывают редактор.
+_SCRIPT_START_CREATE = (
+    _SCRIPT_PREAMBLE
+    + """
+from pathlib import Path
+
+import src.gui.main_window as main_window
+
+main_window.QMessageBox.information = lambda *a, **k: None
+main_window.QMessageBox.critical = lambda *a, **k: None
+
+pptx_target, pdf_target = sys.argv[1], sys.argv[2]
+
+report["start_index_before"] = window.stack.currentIndex()
+
+# DOCX
+window.start_screen._cards["docx"].click()
+report["docx_after"] = [window.stack.currentIndex(), window.tabs.currentIndex()]
+report["docx_path"] = window.editor.current_path
+report["docx_text"] = window.editor.toPlainText()
+report["docx_modified"] = window.editor.is_modified()
+report["docx_title"] = window.windowTitle()
+
+# PPTX
+window.show_start_screen()
+report["after_home"] = window.stack.currentIndex()
+window.start_screen._cards["pptx"].click()
+report["pptx_after"] = [window.stack.currentIndex(), window.tabs.currentIndex()]
+report["pptx_slides"] = window.pptx_editor.slide_count()
+report["pptx_path"] = window.pptx_editor.current_path
+report["pptx_saved"] = window.pptx_editor.save_file(pptx_target)
+report["pptx_file_exists"] = Path(pptx_target).exists()
+
+# PDF
+window.show_start_screen()
+window.start_screen._cards["pdf"].click()
+report["pdf_after"] = [window.stack.currentIndex(), window.tabs.currentIndex()]
+report["pdf_pages"] = window.pdf_editor.page_count()
+report["pdf_path"] = window.pdf_editor.current_path
+report["pdf_rendered"] = not window.pdf_editor.image_label.pixmap().isNull()
+report["pdf_saved"] = window.pdf_editor.save_file(pdf_target)
+report["pdf_file_exists"] = Path(pdf_target).exists()
+report["pdf_saved_path"] = (
+    window.pdf_editor.current_path.name if window.pdf_editor.current_path else None
+)
+report["pdf_pages_after_save"] = window.pdf_editor.page_count()
+
+window.editor.mark_saved()
+window.pptx_editor.mark_saved()
+window.pdf_editor.close_document()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+#: Стартовый экран: открытие файла, список недавних, возврат и ошибка.
+_SCRIPT_START_OPEN = (
+    _SCRIPT_PREAMBLE
+    + """
+from PySide6.QtWidgets import QPushButton
+
+import src.gui.main_window as main_window
+
+errors = []
+main_window.QMessageBox.critical = lambda *a, **k: errors.append(list(a[1:3]))
+
+sample = sys.argv[1]
+
+report["open"] = window.open_path(sample)
+report["index_after_open"] = window.stack.currentIndex()
+report["tab_after_open"] = window.tabs.currentIndex()
+report["recent_after_open"] = window.start_screen.recent_files()
+
+window.show_start_screen()
+report["index_after_home"] = window.stack.currentIndex()
+buttons = window.start_screen.recent_container.findChildren(QPushButton)
+report["recent_buttons"] = [button.text() for button in buttons]
+buttons[0].click()
+report["index_after_recent_click"] = window.stack.currentIndex()
+
+# Повторное открытие не дублирует запись в списке.
+window.show_start_screen()
+window.open_path(sample)
+report["recent_dedup"] = window.start_screen.recent_files()
+
+# Неудачное открытие возвращает на стартовый экран.
+window.show_start_screen()
+report["bad_open"] = window.open_path("/nonexistent/broken.docx")
+report["index_after_bad"] = window.stack.currentIndex()
+report["error_shown"] = bool(errors)
+
+window.editor.mark_saved()
+window.pptx_editor.mark_saved()
+window.pdf_editor.close_document()
+window.close()
+print(json.dumps(report, ensure_ascii=False))
+"""
+)
+
+
 def _gui_environment() -> dict[str, str]:
     """Окружение подпроцесса: offscreen и Qt-библиотеки из PySide6.
 
@@ -1286,10 +1410,30 @@ def _run_gui_script(script: str, *args: str) -> dict:
 
 
 def test_main_window_builds_ui() -> None:
-    """Окно содержит вкладки, меню, панель инструментов и статус-бар."""
+    """Окно содержит стартовый экран, вкладки редактора, меню и статус-бар."""
     report = _run_gui_script(_SCRIPT_UI)
 
-    assert report["central_is_tabs"] is True
+    assert report["central_is_stack"] is True
+    assert report["stack_count"] == 2, report["stack_count"]
+    assert report["start_index"] == 0, "при запуске должен открываться стартовый экран"
+    assert report["start_screen_is_page0"] is True
+    assert report["editor_is_page1"] is True
+
+    assert report["start_heading"] == "Добро пожаловать в TermRu"
+    assert report["start_subtitle"] == "Умный редактор документов с русификацией"
+    assert report["start_cards"] == ["docx", "pdf", "pptx"], report["start_cards"]
+    assert report["start_icons_ok"] is True, "иконки qtawesome не загрузились"
+    assert report["nav_buttons"] == ["about", "home", "open", "settings"]
+    assert report["recent_files"] == [], report["recent_files"]
+
+    assert report["file_menu"] == [
+        "Открыть",
+        "Сохранить",
+        "Сохранить как…",
+        "На главный экран",
+        "Выход",
+    ], report["file_menu"]
+
     assert report["tab_titles"] == [
         "Word (DOCX)",
         "PowerPoint (PPTX)",
@@ -1905,6 +2049,66 @@ def test_rusify_crash_reports_critical_error() -> None:
 
     assert "Traceback (most recent call last)" in stderr, stderr[-2000:]
     assert "RuntimeError: движок сломался" in stderr, stderr[-2000:]
+
+
+def test_start_screen_create_documents(tmp_path: Path) -> None:
+    """Карточки стартового экрана создают пустые документы и открывают редактор."""
+    pptx_target = tmp_path / "new.pptx"
+    pdf_target = tmp_path / "new.pdf"
+
+    report = _run_gui_script(
+        _SCRIPT_START_CREATE, str(pptx_target), str(pdf_target)
+    )
+
+    assert report["start_index_before"] == 0
+    assert report["after_home"] == 0, "«На главный экран» не вернул страницу 0"
+
+    # DOCX: пустой документ без пути, вкладка Word.
+    assert report["docx_after"] == [1, 0], report["docx_after"]
+    assert report["docx_path"] is None
+    assert report["docx_text"] == ""
+    assert report["docx_modified"] is False
+    assert "Новый документ" in report["docx_title"]
+
+    # PPTX: один пустой слайд, сохраняется как новый файл.
+    assert report["pptx_after"] == [1, 1], report["pptx_after"]
+    assert report["pptx_slides"] == 1
+    assert report["pptx_path"] is None
+    assert report["pptx_saved"] is True
+    assert report["pptx_file_exists"] is True
+
+    # PDF: одна страница, рендерится и сохраняется из буфера.
+    assert report["pdf_after"] == [1, 2], report["pdf_after"]
+    assert report["pdf_pages"] == 1
+    assert report["pdf_path"] is None
+    assert report["pdf_rendered"] is True
+    assert report["pdf_saved"] is True
+    assert report["pdf_file_exists"] is True
+    assert report["pdf_saved_path"] == "new.pdf"
+    assert report["pdf_pages_after_save"] == 1
+
+
+def test_start_screen_open_and_recent(tmp_path: Path) -> None:
+    """Открытие файла уводит в редактор, помнит файл и возвращается на главную."""
+    sample = PROJECT_ROOT / "tests" / "fixtures" / "sample.docx"
+    assert sample.is_file()
+
+    report = _run_gui_script(_SCRIPT_START_OPEN, str(sample))
+
+    assert report["open"] is True
+    assert report["index_after_open"] == 1, "стек не переключился на редактор"
+    assert report["tab_after_open"] == 0
+    assert report["recent_after_open"] == [str(sample)], report["recent_after_open"]
+
+    assert report["index_after_home"] == 0
+    assert report["recent_buttons"] == ["sample.docx"], report["recent_buttons"]
+    assert report["index_after_recent_click"] == 1, "клик по недавнему не открыл файл"
+
+    assert report["recent_dedup"] == [str(sample)], report["recent_dedup"]
+
+    assert report["bad_open"] is False
+    assert report["error_shown"] is True
+    assert report["index_after_bad"] == 0, "после ошибки окно не вернулось на главную"
 
 
 def test_gui_entrypoint_imports() -> None:
