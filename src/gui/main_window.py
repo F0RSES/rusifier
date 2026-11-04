@@ -1,7 +1,8 @@
-"""Главное окно TermRu: меню, вкладки, панели инструментов, статус-бар.
+"""Главное окно TermRu: стартовый экран, редактор во вкладках, меню и статус-бар.
 
-Центральный виджет — ``QTabWidget``: вкладка Word (DOCX) и вкладка
-PowerPoint (PPTX). Меню и панели подстраиваются под активную вкладку.
+Центральный виджет — ``QStackedWidget``: 0 — приветственный экран
+(:class:`~src.gui.start_screen.StartScreen`), 1 — редактор с вкладками Word,
+PowerPoint и PDF. Меню и панели подстраиваются под активную вкладку.
 """
 
 
@@ -17,21 +18,23 @@ from PySide6.QtGui import (
     QCloseEvent,
     QFont,
     QKeySequence,
+    QTextBlockFormat,
     QTextCursor,
     QTextListFormat,
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QColorDialog,
     QFileDialog,
     QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
     QProgressDialog,
-    QStyle,
+    QStackedWidget,
     QTabWidget,
     QTextEdit,
-    QToolBar,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -42,13 +45,22 @@ from .pdf_editor import TAB_TITLE as PDF_TAB_TITLE
 from .pdf_editor import PdfEditor
 from .pptx_editor import TAB_TITLE as PPTX_TAB_TITLE
 from .pptx_editor import PptxEditor
+from .ribbon import HOME_TAB, INSERT_TAB, TERMRU_TAB, RibbonWidget
 from .rusify import (
     DEFAULT_EXCEPTIONS,
     DEFAULT_GLOSSARY,
     ReplacementsDialog,
     RusifyWorker,
 )
-from .settings import SettingsDialog, apply_theme, load_settings
+from .settings import (
+    SettingsDialog,
+    apply_theme,
+    load_recent_files,
+    load_settings,
+    remember_recent_file,
+    save_settings,
+)
+from .start_screen import StartScreen, qt_icon
 
 APP_TITLE = "TermRu — Редактор документов"
 DOCX_FILTER = "Документы Word (*.docx)"
@@ -62,6 +74,10 @@ WORD_TAB_TITLE = "Word (DOCX)"
 WORD_TAB_INDEX = 0
 PPTX_TAB_INDEX = 1
 PDF_TAB_INDEX = 2
+
+#: Страницы QStackedWidget: приветственный экран и редактор.
+START_INDEX = 0
+EDITOR_INDEX = 1
 
 #: Подписи действия «Русифицировать» для каждой вкладки.
 RUSSIFY_WORD_LABEL = "Русифицировать документ"
@@ -119,12 +135,42 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.editor, WORD_TAB_TITLE)
         self.tabs.addTab(self.pptx_editor, PPTX_TAB_TITLE)
         self.tabs.addTab(self.pdf_editor, PDF_TAB_TITLE)
-        self.setCentralWidget(self.tabs)
+
+        # Экран редактора: сверху лента (Ribbon), под ней вкладки документов.
+        self.ribbon = RibbonWidget(self)
+        self.editor_screen = QWidget(self)
+        editor_layout = QVBoxLayout(self.editor_screen)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.setSpacing(0)
+        editor_layout.addWidget(self.ribbon)
+        editor_layout.addWidget(self.tabs, 1)
+
+        self.start_screen = StartScreen(self)
+        self.start_screen.create_requested.connect(self.new_document)
+        self.start_screen.open_requested.connect(self.open_document)
+        self.start_screen.recent_requested.connect(self.open_path)
+        self.start_screen.settings_requested.connect(self.open_settings)
+        self.start_screen.about_requested.connect(self.show_about)
+        self.start_screen.file_dropped.connect(self.open_path)
+        self.start_screen.set_recent_files(load_recent_files())
+
+        # Стек экранов: 0 — приветственный, 1 — редактор с лентой и вкладками.
+        self.stack = QStackedWidget(self)
+        self.stack.setObjectName("mainStack")
+        self.stack.addWidget(self.start_screen)  # START_INDEX
+        self.stack.addWidget(self.editor_screen)  # EDITOR_INDEX
+        self.stack.setCurrentIndex(START_INDEX)
+        self.setCentralWidget(self.stack)
+
+        #: Действия, доступные только для DOCX (PPTX/PDF их не поддерживают).
+        self._docx_actions: list[QAction] = []
+        #: База масштаба Word-редактора в пунктах (для пересчёта процентов).
+        self._zoom_base = max(1, self.editor.font().pointSize() or 11)
+        self._zoom_steps = 0
 
         self._build_actions()
         self._build_menus()
-        self._build_toolbar()
-        self._build_format_toolbar()
+        self._build_ribbon()
         self._build_statusbar()
 
         self.editor.textChanged.connect(self._refresh_status)
@@ -214,49 +260,49 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
-        style = self.style()
-        self.action_open = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_DialogOpenButton),
-            "Открыть",
-            self,
-        )
+        self.action_open = QAction(qt_icon("fa5s.folder-open", "#9aa0a6"), "Открыть", self)
+        self.action_open.setObjectName("actionOpen")
         self.action_open.setShortcut(QKeySequence.StandardKey.Open)
         self.action_open.triggered.connect(self.open_document)
 
-        self.action_save = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_DialogSaveButton),
-            "Сохранить",
-            self,
-        )
+        self.action_save = QAction(qt_icon("fa5s.save", "#9aa0a6"), "Сохранить", self)
+        self.action_save.setObjectName("actionSave")
         self.action_save.setShortcut(QKeySequence.StandardKey.Save)
         self.action_save.triggered.connect(self.save_document)
 
-        self.action_save_as = QAction("Сохранить как…", self)
+        self.action_save_as = QAction(
+            qt_icon("fa5s.file-export", "#9aa0a6"), "Сохранить как…", self
+        )
+        self.action_save_as.setObjectName("actionSaveAs")
         self.action_save_as.setShortcut(QKeySequence.StandardKey.SaveAs)
         self.action_save_as.triggered.connect(self.save_document_as)
 
-        self.action_quit = QAction("Выход", self)
+        self.action_quit = QAction(qt_icon("fa5s.sign-out-alt", "#9aa0a6"), "Выход", self)
+        self.action_quit.setObjectName("actionQuit")
         self.action_quit.setShortcut(QKeySequence.StandardKey.Quit)
         self.action_quit.triggered.connect(self.close)
 
-        self.action_russify = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_BrowserReload),
-            "Русифицировать документ",
-            self,
+        self.action_home = QAction(
+            qt_icon("fa5s.home", "#9aa0a6"), "На главный экран", self
         )
+        self.action_home.setObjectName("actionHome")
+        self.action_home.setShortcut(QKeySequence("Ctrl+Shift+H"))
+        self.action_home.triggered.connect(self.show_start_screen)
+
+        self.action_russify = QAction(
+            qt_icon("fa5s.magic", "#9aa0a6"), "Русифицировать документ", self
+        )
+        self.action_russify.setObjectName("action_russify")
         self.action_russify.triggered.connect(self.russify_document)
 
         self.action_settings = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogDetailedView),
-            "Настройки…",
-            self,
+            qt_icon("fa5s.cog", "#9aa0a6"), "Настройки…", self
         )
+        self.action_settings.setObjectName("actionSettings")
         self.action_settings.triggered.connect(self.open_settings)
 
         self.action_glossary = QAction(
-            style.standardIcon(QStyle.StandardPixmap.SP_FileDialogListView),
-            "Редактор словаря…",
-            self,
+            qt_icon("fa5s.book", "#9aa0a6"), "Редактор словаря…", self
         )
         self.action_glossary.setObjectName("actionGlossary")
         self.action_glossary.triggered.connect(self.open_glossary_editor)
@@ -279,6 +325,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(self.action_open)
         file_menu.addAction(self.action_save)
         file_menu.addAction(self.action_save_as)
+        file_menu.addSeparator()
+        file_menu.addAction(self.action_home)
         file_menu.addSeparator()
         file_menu.addAction(self.action_quit)
 
@@ -309,8 +357,11 @@ class MainWindow(QMainWindow):
         help_menu = menubar.addMenu("С&правка")
         help_menu.addAction(self.action_about)
 
-    def _build_toolbar(self) -> None:
-        """Создать панель инструментов с основными действиями.
+    def _build_ribbon(self) -> None:
+        """Собрать ленту: быстрый доступ, вкладки и группы действий.
+
+        Действия создаются здесь же (у окна), а лента их только раскладывает —
+        поэтому один и тот же ``QAction`` работает и в меню, и на ленте.
 
         Returns:
             None
@@ -318,113 +369,211 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
-        toolbar = QToolBar("Основная", self)
-        toolbar.setMovable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        toolbar.addAction(self.action_open)
-        toolbar.addAction(self.action_save)
-        toolbar.addSeparator()
-        toolbar.addAction(self.action_russify)
-        self.addToolBar(toolbar)
-        self.toolbar = toolbar
+        for action in (
+            self.action_open,
+            self.action_save,
+            self.action_save_as,
+            self.action_home,
+        ):
+            self.ribbon.add_quick_action(action)
 
-    def _build_format_toolbar(self) -> None:
-        """Создать панель форматирования: шрифт, выравнивание, списки, таблица.
-
-        Returns:
-            None
-
-        Raises:
-            Ничего не бросает.
-        """
-        toolbar = QToolBar("Форматирование", self)
-        toolbar.setObjectName("formatToolBar")
-        toolbar.setMovable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-
-        self.action_bold = self._make_format_action("Ж", "Жирный (Ctrl+B)", "action_bold")
+        # -- Главная: шрифт --------------------------------------------------
+        self.action_bold = self._ribbon_action(
+            "action_bold", "Жирный", "fa5s.bold", "Жирный (Ctrl+B)", checkable=True
+        )
         self.action_bold.setShortcut(QKeySequence.StandardKey.Bold)
-        self.action_bold.setCheckable(True)
         self.action_bold.toggled.connect(self._toggle_bold)
 
-        self.action_italic = self._make_format_action("К", "Курсив (Ctrl+I)", "action_italic")
+        self.action_italic = self._ribbon_action(
+            "action_italic", "Курсив", "fa5s.italic", "Курсив (Ctrl+I)", checkable=True
+        )
         self.action_italic.setShortcut(QKeySequence.StandardKey.Italic)
-        self.action_italic.setCheckable(True)
         self.action_italic.toggled.connect(self._toggle_italic)
 
-        self.action_underline = self._make_format_action(
-            "Ч", "Подчёркнутый (Ctrl+U)", "action_underline"
+        self.action_underline = self._ribbon_action(
+            "action_underline",
+            "Подчёркнутый",
+            "fa5s.underline",
+            "Подчёркнутый (Ctrl+U)",
+            checkable=True,
         )
         self.action_underline.setShortcut(QKeySequence.StandardKey.Underline)
-        self.action_underline.setCheckable(True)
         self.action_underline.toggled.connect(self._toggle_underline)
 
-        toolbar.addAction(self.action_bold)
-        toolbar.addAction(self.action_italic)
-        toolbar.addAction(self.action_underline)
-        toolbar.addSeparator()
+        for action in (self.action_bold, self.action_italic, self.action_underline):
+            self.ribbon.add_action(HOME_TAB, "Шрифт", action)
 
+        self._build_paragraph_actions()
+        self._build_editing_actions()
+        self._build_insert_tab()
+        self._build_termru_tab()
+
+        self._docx_actions = [
+            self.action_bold,
+            self.action_italic,
+            self.action_underline,
+            self.action_align_left,
+            self.action_align_center,
+            self.action_align_right,
+            self.action_bullet_list,
+            self.action_numbered_list,
+            self.action_table,
+            self.action_image,
+            self.action_text_box,
+            self.action_find,
+        ]
+
+        self._connect_ribbon()
+        self.editor.cursorPositionChanged.connect(self._sync_format_actions)
+        self.editor.selectionChanged.connect(self._sync_format_actions)
+        self._sync_format_actions()
+        self._sync_tab_ui()
+
+    def _build_paragraph_actions(self) -> None:
+        """Создать действия абзаца и положить их в группу «Абзац».
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
         self.align_group = QActionGroup(self)
         self.align_group.setExclusive(True)
-        self.action_align_left = self._make_format_action(
-            "Л", "По левому краю", "action_align_left"
+        self.action_align_left = self._ribbon_action(
+            "action_align_left",
+            "По левому краю",
+            "fa5s.align-left",
+            "По левому краю",
+            checkable=True,
         )
-        self.action_align_center = self._make_format_action(
-            "Ц", "По центру", "action_align_center"
+        self.action_align_center = self._ribbon_action(
+            "action_align_center",
+            "По центру",
+            "fa5s.align-center",
+            "По центру",
+            checkable=True,
         )
-        self.action_align_right = self._make_format_action(
-            "П", "По правому краю", "action_align_right"
+        self.action_align_right = self._ribbon_action(
+            "action_align_right",
+            "По правому краю",
+            "fa5s.align-right",
+            "По правому краю",
+            checkable=True,
         )
         for action, alignment in (
             (self.action_align_left, Qt.AlignmentFlag.AlignLeft),
             (self.action_align_center, Qt.AlignmentFlag.AlignHCenter),
             (self.action_align_right, Qt.AlignmentFlag.AlignRight),
         ):
-            action.setCheckable(True)
             action.setData(alignment)
             self.align_group.addAction(action)
             action.triggered.connect(self._apply_alignment)
-            toolbar.addAction(action)
+            self.ribbon.add_action(HOME_TAB, "Абзац", action)
         self.action_align_left.setChecked(True)
 
-        toolbar.addSeparator()
-        self.action_bullet_list = self._make_format_action(
-            "• Список", "Маркированный список", "action_bullet_list"
+        self.action_bullet_list = self._ribbon_action(
+            "action_bullet_list",
+            "Маркированный список",
+            "fa5s.list-ul",
+            "Маркированный список",
         )
         self.action_bullet_list.triggered.connect(
             lambda: self.insert_list(QTextListFormat.Style.ListDisc)
         )
-        self.action_numbered_list = self._make_format_action(
-            "1. Список", "Нумерованный список", "action_numbered_list"
+        self.action_numbered_list = self._ribbon_action(
+            "action_numbered_list",
+            "Нумерованный список",
+            "fa5s.list-ol",
+            "Нумерованный список",
         )
         self.action_numbered_list.triggered.connect(
             lambda: self.insert_list(QTextListFormat.Style.ListDecimal)
         )
-        toolbar.addAction(self.action_bullet_list)
-        toolbar.addAction(self.action_numbered_list)
+        for action in (self.action_bullet_list, self.action_numbered_list):
+            self.ribbon.add_action(HOME_TAB, "Абзац", action)
 
-        toolbar.addSeparator()
-        self.action_table = self._make_format_action(
-            "Таблица", "Вставить таблицу", "action_table"
+    def _build_editing_actions(self) -> None:
+        """Создать действия группы «Редактирование».
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.action_undo = self._ribbon_action(
+            "action_undo", "Отменить", "fa5s.undo", "Отменить (Ctrl+Z)"
+        )
+        self.action_undo.triggered.connect(lambda: self._dispatch_edit("undo"))
+        self.action_redo = self._ribbon_action(
+            "action_redo", "Вернуть", "fa5s.redo", "Вернуть (Ctrl+Y)"
+        )
+        self.action_redo.triggered.connect(lambda: self._dispatch_edit("redo"))
+        self.action_find = self._ribbon_action(
+            "action_find", "Найти", "fa5s.search", "Найти (Ctrl+F)"
+        )
+        self.action_find.setShortcut(QKeySequence.StandardKey.Find)
+        self.action_find.triggered.connect(self.find_text)
+        for action in (self.action_undo, self.action_redo, self.action_find):
+            self.ribbon.add_action(HOME_TAB, "Редактирование", action)
+
+    def _build_insert_tab(self) -> None:
+        """Наполнить вкладку «Вставка»: таблица, картинка, текстовое поле.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.action_table = self._ribbon_action(
+            "action_table", "Таблица", "fa5s.table", "Вставить таблицу"
         )
         self.action_table.triggered.connect(self.insert_table_dialog)
-        toolbar.addAction(self.action_table)
+        self.ribbon.add_action(INSERT_TAB, "Таблицы", self.action_table, big=True)
 
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
-        self.format_toolbar = toolbar
+        self.action_image = self._ribbon_action(
+            "action_image", "Картинка", "fa5s.image", "Вставить картинку"
+        )
+        self.action_image.triggered.connect(self.insert_image_stub)
+        self.ribbon.add_action(INSERT_TAB, "Иллюстрации", self.action_image, big=True)
 
-        self.editor.cursorPositionChanged.connect(self._sync_format_actions)
-        self.editor.selectionChanged.connect(self._sync_format_actions)
-        self._sync_format_actions()
-        self._sync_tab_ui()
+        self.action_text_box = self._ribbon_action(
+            "action_text_box", "Текстовое поле", "fa5s.font", "Вставить текстовое поле"
+        )
+        self.action_text_box.triggered.connect(self.insert_text_box_stub)
+        self.ribbon.add_action(INSERT_TAB, "Текст", self.action_text_box, big=True)
 
-    def _make_format_action(self, text: str, tooltip: str, object_name: str) -> QAction:
-        """Создать действие панели форматирования.
+    def _build_termru_tab(self) -> None:
+        """Наполнить вкладку TermRu: русификация и словарь.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.ribbon.add_action(TERMRU_TAB, "Русификация", self.action_russify, big=True)
+        self.ribbon.add_action(TERMRU_TAB, "Словарь", self.action_glossary, big=True)
+
+    def _ribbon_action(
+        self,
+        object_name: str,
+        text: str,
+        icon_name: str,
+        tooltip: str,
+        *,
+        checkable: bool = False,
+    ) -> QAction:
+        """Создать действие ленты с векторной иконкой qtawesome.
 
         Args:
-            text: Короткая подпись кнопки (``"Ж"``, ``"Ц"``, …).
-            tooltip: Подсказка с полным названием и горячей клавишей.
-            object_name: Стабильное имя для тестов.
+            object_name: Стабильное имя для тестов и связей.
+            text: Подпись кнопки.
+            icon_name: Имя иконки qtawesome (``fa5s.bold``).
+            tooltip: Подсказка с горячей клавишей.
+            checkable: Нужен ли переключаемый вид.
 
         Returns:
             QAction: созданное действие.
@@ -432,10 +581,33 @@ class MainWindow(QMainWindow):
         Raises:
             Ничего не бросает.
         """
-        action = QAction(text, self)
-        action.setToolTip(tooltip)
+        action = QAction(qt_icon(icon_name, "#9aa0a6"), text, self)
         action.setObjectName(object_name)
+        action.setToolTip(tooltip)
+        action.setCheckable(checkable)
         return action
+
+    def _connect_ribbon(self) -> None:
+        """Связать сигналы ленты с обработчиками окна и прочитать настройки.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        state = load_settings()
+        self.ribbon.set_theme(state["theme"])
+        self.ribbon.set_use_llm(state["use_llm"])
+        self.ribbon.set_zoom(100)
+
+        self.ribbon.theme_changed.connect(self._on_ribbon_theme)
+        self.ribbon.zoom_changed.connect(self.set_zoom)
+        self.ribbon.use_llm_changed.connect(self._on_ribbon_use_llm)
+        self.ribbon.font_combo.currentTextChanged.connect(self.set_font_family)
+        self.ribbon.size_combo.currentTextChanged.connect(self.set_font_size)
+        self.ribbon.color_button.clicked.connect(self.choose_text_color)
+        self.ribbon.spacing_combo.currentIndexChanged.connect(self._on_spacing_changed)
 
     # -- форматирование ------------------------------------------------------
     def _toggle_bold(self, enabled: bool) -> None:
@@ -479,6 +651,144 @@ class MainWindow(QMainWindow):
             Ничего не бросает.
         """
         self.editor.setFontUnderline(enabled)
+
+    # -- лента: шрифт, абзац, вставка ----------------------------------------
+    def set_font_family(self, family: str) -> None:
+        """Применить семейство шрифта из ленты к выделению.
+
+        Args:
+            family: Имя семейства (``DejaVu Sans``).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        name = str(family).strip()
+        if not name:
+            return
+        self.editor.setFontFamily(name)
+
+    def set_font_size(self, size_text: str) -> None:
+        """Применить кегль из списка ленты к выделению.
+
+        Args:
+            size_text: Размер в пунктах как текст (``"14"`` или ``"12,5"``).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает: нечисловое значение игнорируется.
+        """
+        try:
+            size = float(str(size_text).replace(",", ".").strip())
+        except ValueError:
+            return
+        if size <= 0:
+            return
+        self.editor.setFontPointSize(size)
+
+    def choose_text_color(self) -> None:
+        """Спросить цвет текста и применить его к выделению.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        color = QColorDialog.getColor(self.editor.textColor(), self, "Цвет текста")
+        if color.isValid():
+            self.editor.setTextColor(color)
+            self.statusBar().showMessage(f"Цвет текста: {color.name()}", 3000)
+
+    def _on_spacing_changed(self, index: int) -> None:
+        """Применить межстрочный интервал, выбранный в ленте.
+
+        Args:
+            index: Индекс в списке интервалов (``None`` — пусто).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        value = self.ribbon.spacing_combo.itemData(index)
+        if value is None:
+            return
+        self.set_line_spacing(float(value))
+
+    def set_line_spacing(self, factor: float) -> None:
+        """Задать межстрочный интервал текущего абзаца.
+
+        Args:
+            factor: Множитель высоты строки (``1.0``, ``1.15``, ``1.5``, ``2.0``).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        cursor = self.editor.textCursor()
+        block_format = cursor.blockFormat()
+        block_format.setLineHeight(
+            factor * 100, QTextBlockFormat.LineHeightTypes.ProportionalHeight.value
+        )
+        cursor.setBlockFormat(block_format)
+        self.statusBar().showMessage(f"Интервал: {factor:g}", 3000)
+
+    def find_text(self) -> None:
+        """Найти текст в документе и выделить первое вхождение.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        needle, accepted = QInputDialog.getText(self, "Найти", "Что искать:")
+        if not accepted or not needle.strip():
+            return
+        found = self.editor.document().find(needle)
+        if found.isNull():
+            self.statusBar().showMessage(f"Не найдено: {needle}", 3000)
+            return
+        self.editor.setTextCursor(found)
+        self.statusBar().showMessage("Найдено", 2000)
+
+    def insert_image_stub(self) -> None:
+        """Заглушка «Вставить картинку».
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        QMessageBox.information(
+            self,
+            "Вставить картинку",
+            "Вставка изображений появится в следующем обновлении.",
+        )
+
+    def insert_text_box_stub(self) -> None:
+        """Заглушка «Вставить текстовое поле».
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        QMessageBox.information(
+            self,
+            "Текстовое поле",
+            "Текстовые поля появятся в следующем обновлении.",
+        )
 
     def _apply_alignment(self) -> None:
         """Применить выравнивание выбранной кнопки.
@@ -642,8 +952,19 @@ class MainWindow(QMainWindow):
             Ничего не бросает.
         """
         kind = self._active_kind()
-        self.format_toolbar.setVisible(kind == "word")
+        on_editor = self.stack.currentIndex() == EDITOR_INDEX
+        format_enabled = on_editor and kind == "word"
+        for action in self._docx_actions:
+            action.setEnabled(format_enabled)
+        for widget in (
+            self.ribbon.font_combo,
+            self.ribbon.size_combo,
+            self.ribbon.color_button,
+            self.ribbon.spacing_combo,
+        ):
+            widget.setEnabled(format_enabled)
         self.action_russify.setText(RUSSIFY_LABELS[kind])
+        self.action_russify.setEnabled(on_editor)
 
     def _on_tab_changed(self, _index: int) -> None:
         """Обновить интерфейс при переключении вкладки.
@@ -660,6 +981,154 @@ class MainWindow(QMainWindow):
         self._sync_tab_ui()
         self._refresh_title()
         self._refresh_status()
+
+    # -- экраны --------------------------------------------------------------
+    def show_start_screen(self) -> None:
+        """Показать приветственный экран с недавними файлами.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.start_screen.set_recent_files(load_recent_files())
+        self.start_screen.refresh_style()
+        self.stack.setCurrentIndex(START_INDEX)
+        self._sync_tab_ui()
+        self._refresh_title()
+        self._refresh_status()
+
+    def show_editor(self) -> None:
+        """Переключить стек экранов на редактор документов.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.stack.setCurrentIndex(EDITOR_INDEX)
+        self._sync_tab_ui()
+        self._refresh_title()
+        self._refresh_status()
+
+    def new_document(self, kind: str = "docx") -> None:
+        """Создать пустой документ и открыть его в редакторе.
+
+        Args:
+            kind: ``"docx"``, ``"pptx"`` или ``"pdf"`` (неизвестное — DOCX).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        if kind == "pptx":
+            self.tabs.setCurrentIndex(PPTX_TAB_INDEX)
+            self.pptx_editor.new_document()
+        elif kind == "pdf":
+            self.tabs.setCurrentIndex(PDF_TAB_INDEX)
+            self.pdf_editor.new_document()
+        else:
+            self.tabs.setCurrentIndex(WORD_TAB_INDEX)
+            self.editor.clear()
+            self.editor.current_path = None
+            self.editor.mark_saved()
+        self.show_editor()
+        self.statusBar().showMessage("Создан новый документ", 3000)
+
+    def _remember_recent(self, filepath: str) -> None:
+        """Запомнить открытый файл и обновить список на стартовом экране.
+
+        Args:
+            filepath: Путь открытого файла.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        self.start_screen.set_recent_files(remember_recent_file(filepath))
+
+    # -- лента: вид и режимы -------------------------------------------------
+    def set_zoom(self, percent: int) -> None:
+        """Изменить масштаб активного документа (Word — текст, PDF — рендер).
+
+        Args:
+            percent: Масштаб в процентах (50–200).
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        value = max(50, min(200, int(percent)))
+        kind = self._active_kind()
+        if kind == "word":
+            steps = round(self._zoom_base * (value / 100 - 1))
+            delta = steps - self._zoom_steps
+            if delta > 0:
+                self.editor.zoomIn(delta)
+            elif delta < 0:
+                self.editor.zoomOut(-delta)
+            self._zoom_steps = steps
+        elif kind == "pdf":
+            self.pdf_editor.set_zoom(value / 100)
+        self.ribbon.set_zoom(value)
+        self.statusBar().showMessage(f"Масштаб: {value} %", 2000)
+
+    def _on_ribbon_theme(self, theme: str) -> None:
+        """Сменить тему из ленты и сохранить её в настройках.
+
+        Args:
+            theme: ``dark`` или ``light``.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        state = load_settings()
+        save_settings(state["api_key"], state["use_llm"], theme, state["pdf_fonts"])
+        apply_theme(theme)
+        self.ribbon.refresh_style(theme)
+        self.start_screen.refresh_style(theme)
+        self.statusBar().showMessage(f"Тема: {theme}", 2000)
+
+    def _on_ribbon_use_llm(self, enabled: bool) -> None:
+        """Включить/выключить ИИ из ленты.
+
+        Без ключа DeepSeek режим бессмысленен, поэтому флажок снимается обратно
+        и пользователь получает подсказку, где взять ключ.
+
+        Args:
+            enabled: Новое состояние флажка.
+
+        Returns:
+            None
+
+        Raises:
+            Ничего не бросает.
+        """
+        state = load_settings()
+        if enabled and not state["api_key"]:
+            self.ribbon.set_use_llm(False)
+            QMessageBox.information(
+                self,
+                "ИИ (DeepSeek)",
+                "Сначала добавьте ключ API: «Инструменты → Настройки…».",
+            )
+            return
+        save_settings(state["api_key"], enabled, state["theme"], state["pdf_fonts"])
+        self.statusBar().showMessage(
+            "ИИ включён: словарь + DeepSeek" if enabled else "ИИ выключен: только словарь",
+            3000,
+        )
 
     def _edit_target(self) -> QWidget | None:
         """Виджет, к которому применяются команды меню «Правка».
@@ -808,12 +1277,17 @@ class MainWindow(QMainWindow):
             index, target = PPTX_TAB_INDEX, self.pptx_editor
         else:
             index, target = WORD_TAB_INDEX, self.editor
+        # Сначала показываем редактор, потом грузим файл: так пользователь видит,
+        # куда именно откроется документ.
+        self.show_editor()
         self.tabs.setCurrentIndex(index)
         if not target.load_file(filepath):
             self.statusBar().showMessage("Не удалось открыть файл", 5000)
+            self.show_start_screen()
             return False
         self._refresh_title()
         self._refresh_status()
+        self._remember_recent(filepath)
         self.statusBar().showMessage(f"Открыто: {Path(filepath).name}", 3000)
         return True
 
@@ -950,6 +1424,9 @@ class MainWindow(QMainWindow):
         state = load_settings()
         apply_theme(state["theme"])
         self.pdf_editor.set_font_substitution_mode(state["pdf_fonts"])
+        self.start_screen.refresh_style(state["theme"])
+        self.ribbon.set_theme(state["theme"])
+        self.ribbon.set_use_llm(state["use_llm"])
         mode = "ИИ + словарь" if state["use_llm"] else "только словарь"
         self.statusBar().showMessage(
             f"Настройки сохранены ({mode}, тема {state['theme']}, "

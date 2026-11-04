@@ -36,6 +36,10 @@ KEY_API = "deepseek/api_key"
 KEY_USE_LLM = "deepseek/use_llm"
 KEY_THEME = "ui/theme"
 KEY_PDF_FONTS = "pdf/substitute_fonts"
+KEY_RECENT = "files/recent"
+
+#: Сколько недавних файлов помнить и показывать на стартовом экране.
+RECENT_LIMIT = 5
 
 #: Тёмная тема (qdarkstyle) и светлая (тот же стиль со светлой палитрой).
 THEME_DARK = "dark"
@@ -131,6 +135,54 @@ def save_settings(
         pdf_fonts if pdf_fonts in FONT_SUBSTITUTION_MODES else DEFAULT_PDF_FONTS,
     )
     settings.sync()
+
+
+def load_recent_files() -> list[str]:
+    """Прочитать список недавних файлов из QSettings.
+
+    QSettings может вернуть как список, так и одиночную строку (зависит от бэкенда
+    и от того, сколько значений сохранено), поэтому оба варианта приводятся к
+    списку без дубликатов.
+
+    Returns:
+        list[str]: пути в порядке убывания свежести (не больше ``RECENT_LIMIT``).
+
+    Raises:
+        Ничего не бросает.
+    """
+    raw = app_settings().value(KEY_RECENT, [])
+    if isinstance(raw, str):
+        raw = [raw]
+    result: list[str] = []
+    for item in raw or []:
+        text = str(item).strip()
+        if text and text not in result:
+            result.append(text)
+    return result[:RECENT_LIMIT]
+
+
+def remember_recent_file(path: str) -> list[str]:
+    """Добавить файл в начало списка недавних и сохранить его.
+
+    Args:
+        path: Путь открытого файла.
+
+    Returns:
+        list[str]: обновлённый список недавних файлов.
+
+    Raises:
+        Ничего не бросает.
+    """
+    text = str(path).strip()
+    if not text:
+        return load_recent_files()
+    items = [item for item in load_recent_files() if item != text]
+    items.insert(0, text)
+    items = items[:RECENT_LIMIT]
+    settings = app_settings()
+    settings.setValue(KEY_RECENT, items)
+    settings.sync()
+    return items
 
 
 def stylesheet_for(theme: str) -> str:

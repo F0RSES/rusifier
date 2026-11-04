@@ -6,7 +6,14 @@
 
 from __future__ import annotations
 
-__all__ = ["MainWindow", "DocxEditor", "PptxEditor", "PdfEditor", "GlossaryEditorDialog"]
+__all__ = [
+    "MainWindow",
+    "DocxEditor",
+    "PptxEditor",
+    "PdfEditor",
+    "GlossaryEditorDialog",
+    "StartScreen",
+]
 
 
 def __getattr__(name: str) -> object:
@@ -17,7 +24,7 @@ def __getattr__(name: str) -> object:
 
     Returns:
         object: Класс ``MainWindow``, ``DocxEditor``, ``PptxEditor``,
-        ``PdfEditor`` или ``GlossaryEditorDialog``.
+        ``PdfEditor``, ``GlossaryEditorDialog`` или ``StartScreen``.
 
     Raises:
         AttributeError: для неизвестного имени.
@@ -42,4 +49,8 @@ def __getattr__(name: str) -> object:
         from .glossary_editor import GlossaryEditorDialog
 
         return GlossaryEditorDialog
+    if name == "StartScreen":
+        from .start_screen import StartScreen
+
+        return StartScreen
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
