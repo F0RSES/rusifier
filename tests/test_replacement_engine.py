@@ -231,6 +231,41 @@ def test_composite_term_milestone_owner_replaced_whole() -> None:
     assert engine.replace_dict_only("owner")[0] == "владелец"
 
 
+def test_project_glossary_covers_it_and_business() -> None:
+    """Проектный словарь большой, офлайн-переводы официальные, исключения не задеты."""
+    manager = GlossaryManager(
+        str(PROJECT_ROOT / "data" / "glossary.json"),
+        str(PROJECT_ROOT / "data" / "exceptions.json"),
+    )
+    engine = ReplacementEngine(manager)
+
+    assert len(manager.glossary) >= 150, len(manager.glossary)
+
+    expected = {
+        "feature": "функциональность",
+        "bug": "ошибка",
+        "deploy": "развертывание",
+        "pull request": "пулл-реквест",
+        "sprint": "спринт",
+        "backlog": "бэклог",
+        "revenue": "выручка",
+        "churn": "отток",
+        "conversion": "конверсия",
+        "target": "цель",
+    }
+    for term, target in expected.items():
+        assert manager.glossary.get(term) == target, (term, manager.glossary.get(term))
+
+    # В словаре не должно быть терминов, которые объявлены исключениями.
+    clashes = sorted(term for term in manager.glossary if manager.is_exception(term))
+    assert not clashes, clashes
+
+    # Аббревиатуры остаются как есть, а соседние термины переводятся.
+    text, changes = engine.replace_dict_only("Sprint by API: KPI and TLS unchanged, bug fixed")
+    assert text == "Спринт by API: KPI and TLS unchanged, ошибка fixed", text
+    assert [change["original"] for change in changes] == ["Sprint", "bug"], changes
+
+
 def test_empty_text_and_type_errors(engine: ReplacementEngine) -> None:
     """Пустой текст — без изменений; не-строка — TypeError."""
     assert engine.replace_dict_only("") == ("", [])

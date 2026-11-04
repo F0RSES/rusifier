@@ -319,14 +319,14 @@ class FakeClient:
         FakeClient.calls.append(
             {"key": self.api_key, "block_id": block_id, "text": text}
         )
-        return text.replace("report is ready", "отчёт готов")
+        return text.replace("audit is ready", "аудит готов")
 
 
 rusify.DeepSeekClient = FakeClient
 
 events = {"result": None, "error": None}
 loop = QEventLoop()
-worker = RusifyWorker("The feedback and report is ready", use_llm=True, api_key="test-key")
+worker = RusifyWorker("The feedback and audit is ready", use_llm=True, api_key="test-key")
 worker.result_ready.connect(
     lambda text, changes: (events.update(result=[text, list(changes)]), loop.quit())
 )
@@ -1595,7 +1595,7 @@ def test_rusify_worker_with_mock_llm() -> None:
     assert report["error"] is None, report["error"]
     assert report["result"] is not None
     new_text, changes = report["result"]
-    assert "отчёт готов" in new_text
+    assert "аудит готов" in new_text
 
     sources = {item["source"] for item in changes}
     assert "dict" in sources and "llm" in sources, sources
@@ -1603,7 +1603,7 @@ def test_rusify_worker_with_mock_llm() -> None:
     llm_pairs = [
         (item["original"], item["replacement"]) for item in changes if item["source"] == "llm"
     ]
-    assert ("report is ready", "отчёт готов") in llm_pairs, llm_pairs
+    assert ("audit is ready", "аудит готов") in llm_pairs, llm_pairs
 
     assert report["calls"], "LLM не вызывалась"
     assert report["calls"][0]["key"] == "test-key"
